@@ -1,0 +1,14 @@
+target/
+
+.idea/
+*.iml
+
+.DS_Store
+
+*.log
+
+.env
+.env.*
+
+*.swp
+*.swo

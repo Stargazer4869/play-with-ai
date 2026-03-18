@@ -1,0 +1,8 @@
+spring:
+  ai:
+    mcp:
+      server:
+        name: mcp-weather-server
+        protocol: STREAMABLE
+        request-timeout: 1h
+        port: 8080

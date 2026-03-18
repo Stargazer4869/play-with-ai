@@ -1,0 +1,34 @@
+spring:
+  data:
+    redis:
+#      url: localhost:6379
+      host: localhost
+      port: 6379
+      client-type: jedis
+  ai:
+    chat:
+      client:
+        observations:
+          log-prompt: true
+          log-completion: true
+    model:
+      chat: openai
+    openai:
+      api-key: ''
+      base-url: ''
+      chat:
+        options:
+          model: gpt-5.4
+          temperature: 0.2
+    vectorstore:
+      type: 'redis'
+      redis:
+        initialize-schema: true
+        index-name: index-name-for-test-vectorstore
+        prefix: for-test-vectorstore
+
+copilot:
+  agent-mode: "react"
+  react:
+    max-steps: 100
+    max-actions-per-step: 3
