@@ -1,0 +1,15 @@
+spring:
+  config:
+    import: optional:classpath:codex-runtime-defaults.yml
+  main:
+    web-application-type: none
+  ai:
+    mcp:
+      client:
+        streamable-http:
+          connections:
+            my-weather-server:
+              url: http://localhost:8080
+
+server:
+  port: 8081

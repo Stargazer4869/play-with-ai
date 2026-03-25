@@ -1,0 +1,15 @@
+spring:
+  config:
+    import: optional:classpath:codex-runtime-defaults.yml
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      client-type: jedis
+  ai:
+    vectorstore:
+      type: redis
+      redis:
+        initialize-schema: true
+        index-name: index-name-for-test-vectorstore
+        prefix: for-test-vectorstore

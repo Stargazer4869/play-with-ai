@@ -1,0 +1,16 @@
+spring:
+  ai:
+    chat:
+      client:
+        observations:
+          log-prompt: true
+          log-completion: true
+    model:
+      chat: openai
+    openai:
+      api-key: ${OPENAI_API_KEY:}
+      base-url: ${OPENAI_BASE_URL:https://api.openai.com/v1}
+      chat:
+        options:
+          model: ${CODEX_CHAT_MODEL:gpt-5.4}
+          temperature: ${CODEX_TEMPERATURE:0.2}

@@ -1,0 +1,16 @@
+spring:
+  config:
+    import: optional:classpath:codex-runtime-defaults.yml
+  main:
+    web-application-type: none
+
+codex:
+  workspace-root: ${user.dir}
+  storage-root: ${user.home}/.codex-java
+  shell:
+    approval-mode: ${CODEX_SHELL_APPROVAL_MODE:review-sensitive}
+    timeout-seconds: ${CODEX_SHELL_TIMEOUT_SECONDS:60}
+  agent:
+    max-steps: 100
+    max-actions-per-turn: 3
+    history-window: 8
