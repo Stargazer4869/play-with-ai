@@ -6,6 +6,7 @@ import org.dean.codex.protocol.conversation.ThreadSummary;
 import org.dean.codex.protocol.conversation.TurnId;
 import org.dean.codex.protocol.conversation.TurnStatus;
 import org.dean.codex.protocol.event.TurnEvent;
+import org.dean.codex.protocol.item.TurnItem;
 
 import java.time.Instant;
 import java.util.ArrayList;
@@ -45,6 +46,7 @@ public class InMemoryConversationStore implements ConversationStore {
                 TurnStatus.RUNNING,
                 safeStartedAt,
                 null,
+                List.of(),
                 List.of()));
         record.updatedAt = safeStartedAt;
         return turnId;
@@ -66,7 +68,29 @@ public class InMemoryConversationStore implements ConversationStore {
                 turn.status(),
                 turn.startedAt(),
                 turn.completedAt(),
-                List.copyOf(mergedEvents)));
+                List.copyOf(mergedEvents),
+                turn.items()));
+        record.updatedAt = Instant.now();
+    }
+
+    @Override
+    public synchronized void appendTurnItems(ThreadId threadId, TurnId turnId, List<TurnItem> items) {
+        ThreadRecord record = requireThread(threadId);
+        ConversationTurn turn = requireTurn(record, turnId);
+        List<TurnItem> mergedItems = new ArrayList<>(turn.items());
+        if (items != null) {
+            mergedItems.addAll(items);
+        }
+        replaceTurn(record, new ConversationTurn(
+                turn.turnId(),
+                turn.threadId(),
+                turn.userInput(),
+                turn.finalAnswer(),
+                turn.status(),
+                turn.startedAt(),
+                turn.completedAt(),
+                turn.events(),
+                List.copyOf(mergedItems)));
         record.updatedAt = Instant.now();
     }
 
@@ -81,8 +105,9 @@ public class InMemoryConversationStore implements ConversationStore {
                 turn.finalAnswer(),
                 status == null ? turn.status() : status,
                 turn.startedAt(),
-                status == TurnStatus.COMPLETED || status == TurnStatus.FAILED ? (updatedAt == null ? Instant.now() : updatedAt) : null,
-                turn.events()));
+                isTerminal(status) ? (updatedAt == null ? Instant.now() : updatedAt) : null,
+                turn.events(),
+                turn.items()));
         record.updatedAt = updatedAt == null ? Instant.now() : updatedAt;
     }
 
@@ -99,7 +124,8 @@ public class InMemoryConversationStore implements ConversationStore {
                 status == null ? TurnStatus.COMPLETED : status,
                 turn.startedAt(),
                 safeCompletedAt,
-                turn.events()));
+                turn.events(),
+                turn.items()));
         record.updatedAt = safeCompletedAt;
     }
 
@@ -149,6 +175,12 @@ public class InMemoryConversationStore implements ConversationStore {
             }
         }
         throw new IllegalArgumentException("Unknown turn id: " + updatedTurn.turnId().value());
+    }
+
+    private boolean isTerminal(TurnStatus status) {
+        return status == TurnStatus.COMPLETED
+                || status == TurnStatus.FAILED
+                || status == TurnStatus.INTERRUPTED;
     }
 
     private static final class ThreadRecord {

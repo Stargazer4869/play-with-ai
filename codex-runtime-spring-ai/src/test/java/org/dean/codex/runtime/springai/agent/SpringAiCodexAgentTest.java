@@ -1,11 +1,16 @@
 package org.dean.codex.runtime.springai.agent;
 
 import org.dean.codex.core.approval.CommandApprovalService;
+import org.dean.codex.core.context.ThreadContextReconstructionService;
 import org.dean.codex.core.conversation.InMemoryConversationStore;
+import org.dean.codex.core.skill.ResolvedSkill;
+import org.dean.codex.core.skill.SkillService;
 import org.dean.codex.core.tool.local.ShellCommandTool;
 import org.dean.codex.protocol.approval.ApprovalId;
 import org.dean.codex.protocol.approval.ApprovalStatus;
 import org.dean.codex.protocol.approval.CommandApprovalRequest;
+import org.dean.codex.protocol.context.ReconstructedThreadContext;
+import org.dean.codex.protocol.context.ThreadMemory;
 import org.dean.codex.protocol.conversation.ThreadId;
 import org.dean.codex.protocol.conversation.TurnId;
 import org.dean.codex.protocol.conversation.TurnStatus;
@@ -16,6 +21,8 @@ import org.dean.codex.protocol.tool.FileSearchResult;
 import org.dean.codex.protocol.tool.FileWriteResult;
 import org.dean.codex.protocol.tool.SearchMatch;
 import org.dean.codex.protocol.tool.ShellCommandResult;
+import org.dean.codex.protocol.skill.SkillMetadata;
+import org.dean.codex.protocol.skill.SkillScope;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.ai.chat.client.ChatClient;
@@ -51,11 +58,11 @@ class SpringAiCodexAgentTest {
                 (path, content) -> new FileWriteResult(true, path, true, content == null ? 0 : content.length(), ""),
                 new StubShellCommandTool(),
                 new NoOpCommandApprovalService(),
-                new InMemoryConversationStore(),
+                new NoOpThreadContextReconstructionService(),
+                new NoOpSkillService(),
                 Path.of("/tmp/workspace"),
                 6,
-                2,
-                8
+                2
         );
     }
 
@@ -141,6 +148,50 @@ class SpringAiCodexAgentTest {
     }
 
     @Test
+    void parseDecisionSupportsEditPlanWithCommandAction() {
+        SpringAiCodexAgent.PlannerStep step = agent.parseDecision("""
+                {
+                  "summary": "Verify the README adjustment",
+                  "editPlan": {
+                    "summary": "Validate the README adjustment",
+                    "edits": [
+                      {
+                        "path": "README.md",
+                        "type": "MODIFY",
+                        "description": "document the new CLI streaming behavior"
+                      }
+                    ]
+                  },
+                  "actions": [
+                    {"action": "RUN_COMMAND", "command": "git diff -- README.md"}
+                  ]
+                }
+                """);
+
+        assertFalse(step.isFinished());
+        assertNull(step.validationError());
+        assertEquals("Validate the README adjustment", step.editPlan().summary());
+        assertEquals(1, step.editPlan().edits().size());
+        assertEquals(SpringAiCodexAgent.ToolAction.RUN_COMMAND, step.actions().get(0).action());
+        assertEquals("git diff -- README.md", step.actions().get(0).command());
+    }
+
+    @Test
+    void parseDecisionRejectsCommandWithoutCommandText() {
+        SpringAiCodexAgent.PlannerStep step = agent.parseDecision("""
+                {
+                  "summary": "Run a command",
+                  "actions": [
+                    {"action": "RUN_COMMAND"}
+                  ]
+                }
+                """);
+
+        assertFalse(step.isFinished());
+        assertTrue(step.validationError().contains("command"));
+    }
+
+    @Test
     void handleTurnReturnsStructuredResult() {
         ThreadId threadId = new ThreadId("thread-1");
         TurnId turnId = new TurnId("turn-1");
@@ -157,6 +208,64 @@ class SpringAiCodexAgentTest {
         assertEquals(threadId, result.threadId());
         assertEquals(turnId, result.turnId());
         assertEquals(TurnStatus.FAILED, result.status());
+    }
+
+    @Test
+    void userPromptIncludesSelectedSkillInstructions() {
+        InMemoryConversationStore conversationStore = new InMemoryConversationStore();
+        ThreadId threadId = conversationStore.createThread("Skill prompt thread");
+        SkillMetadata metadata = new SkillMetadata(
+                "reviewer",
+                "Review code for bugs.",
+                "Review code for bugs.",
+                "/tmp/reviewer/SKILL.md",
+                SkillScope.USER,
+                true);
+        agent = new SpringAiCodexAgent(
+                new NoOpChatClientBuilder(),
+                path -> new FileReadResult(true, path, "", false, 0, ""),
+                (query, scope) -> new FileSearchResult(true, query, scope, List.of(), 0, false, ""),
+                (path, oldText, newText, replaceAll) -> new FilePatchResult(true, path, 1, 0, ""),
+                (path, content) -> new FileWriteResult(true, path, true, content == null ? 0 : content.length(), ""),
+                new StubShellCommandTool(),
+                new NoOpCommandApprovalService(),
+                new FixedThreadContextReconstructionService(new ReconstructedThreadContext(
+                        threadId,
+                        new ThreadMemory(
+                                "memory-1",
+                                threadId,
+                                "Compacted earlier thread context.",
+                                List.of(),
+                                0,
+                                Instant.now()),
+                        List.of(),
+                        List.of(),
+                        List.of(),
+                        Instant.now())),
+                new StaticSkillService(new ResolvedSkill(metadata, "# reviewer\n\nReview carefully.")),
+                Path.of("/tmp/workspace"),
+                6,
+                2
+        );
+
+        var selectedSkills = agent.selectedSkillsForInput("Please use $reviewer");
+        String prompt = agent.buildUserPrompt(
+                new ReconstructedThreadContext(
+                        threadId,
+                        new ThreadMemory("memory-1", threadId, "Compacted earlier thread context.", List.of(), 0, Instant.now()),
+                        List.of(),
+                        List.of(),
+                        List.of(),
+                        Instant.now()),
+                "Please use $reviewer",
+                "",
+                1,
+                selectedSkills,
+                List.of());
+
+        assertTrue(prompt.contains("Skill: reviewer"));
+        assertTrue(prompt.contains("Review carefully."));
+        assertTrue(prompt.contains("Compacted earlier thread context."));
     }
 
     private static final class NoOpChatClientBuilder implements ChatClient.Builder {
@@ -336,6 +445,62 @@ class SpringAiCodexAgentTest {
         public ShellCommandResult runApprovedCommand(String command) {
             return new ShellCommandResult(true, command, 0, "", "", false, "/tmp/workspace", true,
                     CommandApprovalDecision.ALLOW, "Explicitly approved", "");
+        }
+    }
+
+    private static final class NoOpSkillService implements SkillService {
+
+        @Override
+        public List<SkillMetadata> listSkills(boolean forceReload) {
+            return List.of();
+        }
+
+        @Override
+        public List<ResolvedSkill> resolveSkills(String input, boolean forceReload) {
+            return List.of();
+        }
+    }
+
+    private static final class NoOpThreadContextReconstructionService implements ThreadContextReconstructionService {
+
+        @Override
+        public ReconstructedThreadContext reconstruct(ThreadId threadId) {
+            return new ReconstructedThreadContext(threadId, null, List.of(), List.of(), List.of(), Instant.now());
+        }
+    }
+
+    private static final class FixedThreadContextReconstructionService implements ThreadContextReconstructionService {
+
+        private final ReconstructedThreadContext reconstructedThreadContext;
+
+        private FixedThreadContextReconstructionService(ReconstructedThreadContext reconstructedThreadContext) {
+            this.reconstructedThreadContext = reconstructedThreadContext;
+        }
+
+        @Override
+        public ReconstructedThreadContext reconstruct(ThreadId threadId) {
+            return reconstructedThreadContext;
+        }
+    }
+
+    private static final class StaticSkillService implements SkillService {
+
+        private final ResolvedSkill resolvedSkill;
+
+        private StaticSkillService(ResolvedSkill resolvedSkill) {
+            this.resolvedSkill = resolvedSkill;
+        }
+
+        @Override
+        public List<SkillMetadata> listSkills(boolean forceReload) {
+            return List.of(resolvedSkill.metadata());
+        }
+
+        @Override
+        public List<ResolvedSkill> resolveSkills(String input, boolean forceReload) {
+            return input != null && input.contains("$" + resolvedSkill.metadata().name())
+                    ? List.of(resolvedSkill)
+                    : List.of();
         }
     }
 }

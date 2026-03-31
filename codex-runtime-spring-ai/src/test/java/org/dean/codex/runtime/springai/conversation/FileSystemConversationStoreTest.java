@@ -5,7 +5,7 @@ import org.dean.codex.protocol.conversation.ItemId;
 import org.dean.codex.protocol.conversation.ThreadId;
 import org.dean.codex.protocol.conversation.TurnId;
 import org.dean.codex.protocol.conversation.TurnStatus;
-import org.dean.codex.protocol.event.TurnEvent;
+import org.dean.codex.protocol.item.ToolCallItem;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -27,10 +27,10 @@ class FileSystemConversationStoreTest {
         ThreadId threadId = firstStore.createThread("Persistent thread");
         Instant startedAt = Instant.parse("2026-03-25T00:00:00Z");
         TurnId turnId = firstStore.startTurn(threadId, "hello", startedAt);
-        firstStore.appendTurnEvents(threadId, turnId, List.of(new TurnEvent(
+        firstStore.appendTurnItems(threadId, turnId, List.of(new ToolCallItem(
                 new ItemId("event-1"),
-                "tool.call",
-                "READ_FILE path=README.md",
+                "READ_FILE",
+                "README.md",
                 startedAt.plusSeconds(1))));
         firstStore.completeTurn(threadId, turnId, TurnStatus.COMPLETED, "done", startedAt.plusSeconds(2));
 
@@ -42,6 +42,6 @@ class FileSystemConversationStoreTest {
         assertEquals(1, secondStore.turns(threadId).size());
         assertEquals("hello", secondStore.turns(threadId).get(0).userInput());
         assertEquals("done", secondStore.turns(threadId).get(0).finalAnswer());
-        assertEquals(1, secondStore.turns(threadId).get(0).events().size());
+        assertEquals(1, secondStore.turns(threadId).get(0).items().size());
     }
 }

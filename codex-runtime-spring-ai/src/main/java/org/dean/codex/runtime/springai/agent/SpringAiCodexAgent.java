@@ -5,19 +5,39 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.dean.codex.core.approval.CommandApprovalService;
 import org.dean.codex.core.agent.CodexAgent;
-import org.dean.codex.core.conversation.ConversationStore;
+import org.dean.codex.core.agent.TurnControl;
+import org.dean.codex.core.context.ThreadContextReconstructionService;
+import org.dean.codex.core.skill.ResolvedSkill;
+import org.dean.codex.core.skill.SkillService;
 import org.dean.codex.core.tool.local.FilePatchTool;
 import org.dean.codex.core.tool.local.FileReaderTool;
 import org.dean.codex.core.tool.local.FileSearchTool;
 import org.dean.codex.core.tool.local.FileWriterTool;
 import org.dean.codex.core.tool.local.ShellCommandTool;
+import org.dean.codex.protocol.planning.EditPlan;
+import org.dean.codex.protocol.planning.PlannedEdit;
+import org.dean.codex.protocol.planning.PlannedEditType;
 import org.dean.codex.protocol.conversation.ItemId;
 import org.dean.codex.protocol.conversation.ThreadId;
 import org.dean.codex.protocol.conversation.TurnId;
 import org.dean.codex.protocol.conversation.TurnStatus;
 import org.dean.codex.protocol.event.CodexTurnResult;
 import org.dean.codex.protocol.event.TurnEvent;
+import org.dean.codex.protocol.item.AgentMessageItem;
+import org.dean.codex.protocol.item.ApprovalItem;
+import org.dean.codex.protocol.item.ApprovalState;
+import org.dean.codex.protocol.item.PlanItem;
+import org.dean.codex.protocol.item.RuntimeErrorItem;
+import org.dean.codex.protocol.item.SkillUseItem;
+import org.dean.codex.protocol.item.ToolCallItem;
+import org.dean.codex.protocol.item.ToolResultItem;
+import org.dean.codex.protocol.item.TurnItem;
+import org.dean.codex.protocol.item.UserMessageItem;
 import org.dean.codex.protocol.approval.CommandApprovalRequest;
+import org.dean.codex.protocol.context.ReconstructedThreadContext;
+import org.dean.codex.protocol.context.ReconstructedTurnActivity;
+import org.dean.codex.protocol.context.ThreadMemory;
+import org.dean.codex.protocol.skill.SkillMetadata;
 import org.dean.codex.protocol.tool.CommandApprovalDecision;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -33,8 +53,10 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
 @Component
@@ -49,12 +71,12 @@ public class SpringAiCodexAgent implements CodexAgent {
     private final FileWriterTool fileWriterTool;
     private final ShellCommandTool shellCommandTool;
     private final CommandApprovalService commandApprovalService;
-    private final ConversationStore conversationStore;
+    private final ThreadContextReconstructionService threadContextReconstructionService;
+    private final SkillService skillService;
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final Path workspaceRoot;
     private final int maxSteps;
     private final int maxActionsPerTurn;
-    private final int historyWindow;
 
     @Autowired
     public SpringAiCodexAgent(ChatClient.Builder chatClientBuilder,
@@ -64,11 +86,11 @@ public class SpringAiCodexAgent implements CodexAgent {
                               FileWriterTool fileWriterTool,
                               ShellCommandTool shellCommandTool,
                               CommandApprovalService commandApprovalService,
-                              ConversationStore conversationStore,
+                              ThreadContextReconstructionService threadContextReconstructionService,
+                              SkillService skillService,
                               @Qualifier("codexWorkspaceRoot") Path workspaceRoot,
                               @Value("${codex.agent.max-steps:12}") int maxSteps,
-                              @Value("${codex.agent.max-actions-per-turn:3}") int maxActionsPerTurn,
-                              @Value("${codex.agent.history-window:8}") int historyWindow) {
+                              @Value("${codex.agent.max-actions-per-turn:3}") int maxActionsPerTurn) {
         this.chatClient = chatClientBuilder.clone()
                 .defaultAdvisors(new SimpleLoggerAdvisor())
                 .build();
@@ -78,65 +100,127 @@ public class SpringAiCodexAgent implements CodexAgent {
         this.fileWriterTool = fileWriterTool;
         this.shellCommandTool = shellCommandTool;
         this.commandApprovalService = commandApprovalService;
-        this.conversationStore = conversationStore;
+        this.threadContextReconstructionService = threadContextReconstructionService;
+        this.skillService = skillService;
         this.workspaceRoot = workspaceRoot;
         this.maxSteps = Math.max(1, maxSteps);
         this.maxActionsPerTurn = Math.max(1, maxActionsPerTurn);
-        this.historyWindow = Math.max(1, historyWindow);
     }
 
     @Override
     public synchronized CodexTurnResult handleTurn(ThreadId threadId, TurnId turnId, String input) {
+        return handleTurn(threadId, turnId, input, null);
+    }
+
+    @Override
+    public synchronized CodexTurnResult handleTurn(ThreadId threadId, TurnId turnId, String input, Consumer<TurnItem> itemConsumer) {
+        return handleTurn(threadId, turnId, input, itemConsumer, new TurnControl() { });
+    }
+
+    @Override
+    public synchronized CodexTurnResult handleTurn(ThreadId threadId,
+                                                   TurnId turnId,
+                                                   String input,
+                                                   Consumer<TurnItem> itemConsumer,
+                                                   TurnControl turnControl) {
         String safeInput = input == null ? "" : input.trim();
+        TurnControl safeTurnControl = turnControl == null ? new TurnControl() { } : turnControl;
         try {
-            ExecutionOutcome outcome = runPlanningLoop(threadId, turnId, safeInput);
+            List<ResolvedSkill> selectedSkills = selectedSkillsForInput(safeInput);
+            List<SkillMetadata> availableSkills = skillService.listSkills(false);
+            List<TurnItem> preludeItems = new ArrayList<>();
+            if (!selectedSkills.isEmpty()) {
+                SkillUseItem skillUseItem = skillUseItem(selectedSkills.stream().map(ResolvedSkill::metadata).toList());
+                emitItem(preludeItems, itemConsumer, skillUseItem);
+            }
+            ExecutionOutcome outcome = runPlanningLoop(
+                    threadId,
+                    turnId,
+                    safeInput,
+                    itemConsumer,
+                    safeTurnControl,
+                    preludeItems,
+                    selectedSkills,
+                    availableSkills);
             String finalAnswer = outcome.finalAnswer() == null || outcome.finalAnswer().isBlank()
                     ? "I couldn't produce a response for that request."
                     : outcome.finalAnswer();
-            return new CodexTurnResult(threadId, turnId, outcome.status(), outcome.events(), finalAnswer);
+            return new CodexTurnResult(threadId, turnId, outcome.status(), outcome.items(), finalAnswer);
         }
         catch (Exception exception) {
             logger.debug("Codex turn failed for thread {} with input: {}", threadId.value(), safeInput, exception);
-            TurnEvent errorEvent = turnEvent("runtime.error", safeMessage(exception.getMessage()));
+            RuntimeErrorItem errorItem = runtimeErrorItem(safeMessage(exception.getMessage()));
+            emitItem(new ArrayList<>(), itemConsumer, errorItem);
             return new CodexTurnResult(
                     threadId,
                     turnId,
                     TurnStatus.FAILED,
-                    List.of(errorEvent),
+                    List.of(errorItem),
                     "The Codex agent hit an error: " + safeMessage(exception.getMessage()));
         }
     }
 
-    private ExecutionOutcome runPlanningLoop(ThreadId threadId, TurnId turnId, String input) {
-        List<TurnEvent> events = new ArrayList<>();
+    private ExecutionOutcome runPlanningLoop(ThreadId threadId,
+                                             TurnId turnId,
+                                             String input,
+                                             Consumer<TurnItem> itemConsumer,
+                                             TurnControl turnControl,
+                                             List<TurnItem> preludeItems,
+                                             List<ResolvedSkill> selectedSkills,
+                                             List<SkillMetadata> availableSkills) {
+        List<TurnItem> items = new ArrayList<>(preludeItems);
         StringBuilder scratchpad = new StringBuilder();
         String lastObservation = "(none)";
 
         for (int step = 1; step <= maxSteps; step++) {
-            PlannerStep decision = requestDecision(threadId, input, scratchpad.toString(), step);
+            if (turnControl.interruptionRequested()) {
+                return interruptedOutcome(items, itemConsumer);
+            }
+            List<String> steeringInputs = turnControl.drainSteeringInputs();
+            if (!steeringInputs.isEmpty()) {
+                steeringInputs.forEach(steeringInput ->
+                        emitItem(items, itemConsumer, new UserMessageItem(new ItemId(UUID.randomUUID().toString()), steeringInput, Instant.now())));
+            }
+            PlannerStep decision = requestDecision(
+                    threadId,
+                    input,
+                    scratchpad.toString(),
+                    step,
+                    selectedSkills,
+                    availableSkills,
+                    steeringInputs);
+            if (turnControl.interruptionRequested()) {
+                return interruptedOutcome(items, itemConsumer);
+            }
+            if (decision.editPlan() != null && !decision.editPlan().edits().isEmpty()) {
+                emitItem(items, itemConsumer, planItem(decision.editPlan()));
+            }
             if (decision.isFinished()) {
+                String finalAnswer = decision.finalAnswer() == null || decision.finalAnswer().isBlank()
+                        ? "I have finished the task, but the model did not provide a final answer."
+                        : decision.finalAnswer();
+                emitItem(items, itemConsumer, agentMessageItem(finalAnswer));
                 return new ExecutionOutcome(
                         TurnStatus.COMPLETED,
-                        List.copyOf(events),
-                        decision.finalAnswer() == null || decision.finalAnswer().isBlank()
-                                ? "I have finished the task, but the model did not provide a final answer."
-                                : decision.finalAnswer());
+                        List.copyOf(items),
+                        finalAnswer);
             }
 
             String observation;
             BatchExecutionOutcome batchOutcome = null;
             if (decision.validationError() == null) {
-                batchOutcome = executeActions(threadId, turnId, decision.actions(), events);
+                batchOutcome = executeActions(threadId, turnId, decision.actions(), items, itemConsumer);
                 observation = batchOutcome.observation();
             }
             else {
                 observation = createErrorObservation(decision.validationError());
-                events.add(turnEvent("runtime.validation", decision.validationError()));
+                emitItem(items, itemConsumer, runtimeErrorItem(decision.validationError()));
             }
 
             lastObservation = observation;
             scratchpad.append("Step ").append(step).append(':').append(System.lineSeparator())
                     .append("Summary: ").append(blankToPlaceholder(decision.summary())).append(System.lineSeparator())
+                    .append("Edit plan: ").append(summarizeEditPlan(decision.editPlan())).append(System.lineSeparator())
                     .append("Actions: ").append(describeActions(decision.actions())).append(System.lineSeparator())
                     .append("Observation: ").append(observation).append(System.lineSeparator()).append(System.lineSeparator());
 
@@ -146,24 +230,47 @@ public class SpringAiCodexAgent implements CodexAgent {
                         : batchOutcome.approvalIds().stream()
                         .map(this::shortApprovalId)
                         .collect(Collectors.joining(", "));
+                String approvalMessage = "Approval required for command execution. Review with :approvals and continue with :approve <id-prefix> or :reject <id-prefix>. Pending approval ids: " + approvalList;
+                emitItem(items, itemConsumer, agentMessageItem(approvalMessage));
                 return new ExecutionOutcome(
                         TurnStatus.AWAITING_APPROVAL,
-                        List.copyOf(events),
-                        "Approval required for command execution. Review with :approvals and continue with :approve <id-prefix> or :reject <id-prefix>. Pending approval ids: " + approvalList);
+                        List.copyOf(items),
+                        approvalMessage);
+            }
+            if (turnControl.interruptionRequested()) {
+                return interruptedOutcome(items, itemConsumer);
             }
         }
 
-        events.add(turnEvent("runtime.incomplete", "Stopped after " + maxSteps + " planner steps."));
+        emitItem(items, itemConsumer, runtimeErrorItem("Stopped after " + maxSteps + " planner steps."));
+        String finalAnswer = "I stopped after %d planner steps without reaching a final answer. Last observation:%n%s"
+                .formatted(maxSteps, lastObservation);
+        emitItem(items, itemConsumer, agentMessageItem(finalAnswer));
         return new ExecutionOutcome(
                 TurnStatus.COMPLETED,
-                List.copyOf(events),
-                "I stopped after %d planner steps without reaching a final answer. Last observation:%n%s"
-                        .formatted(maxSteps, lastObservation));
+                List.copyOf(items),
+                finalAnswer);
     }
 
-    private PlannerStep requestDecision(ThreadId threadId, String input, String scratchpad, int step) {
-        String systemPrompt = buildSystemPrompt();
-        String userPrompt = buildUserPrompt(threadId, input, scratchpad, step);
+    private ExecutionOutcome interruptedOutcome(List<TurnItem> items, Consumer<TurnItem> itemConsumer) {
+        String finalAnswer = "Turn interrupted.";
+        emitItem(items, itemConsumer, agentMessageItem(finalAnswer));
+        return new ExecutionOutcome(
+                TurnStatus.INTERRUPTED,
+                List.copyOf(items),
+                finalAnswer);
+    }
+
+    private PlannerStep requestDecision(ThreadId threadId,
+                                        String input,
+                                        String scratchpad,
+                                        int step,
+                                        List<ResolvedSkill> selectedSkills,
+                                        List<SkillMetadata> availableSkills,
+                                        List<String> steeringInputs) {
+        String systemPrompt = buildSystemPrompt(availableSkills);
+        ReconstructedThreadContext reconstructedContext = threadContextReconstructionService.reconstruct(threadId);
+        String userPrompt = buildUserPrompt(reconstructedContext, input, scratchpad, step, selectedSkills, steeringInputs);
         logger.debug("Codex planner request step {}\nSystem:\n{}\nUser:\n{}", step, systemPrompt, userPrompt);
 
         String response = chatClient.prompt()
@@ -179,7 +286,11 @@ public class SpringAiCodexAgent implements CodexAgent {
         return decision;
     }
 
-    BatchExecutionOutcome executeActions(ThreadId threadId, TurnId turnId, List<ToolActionRequest> actions, List<TurnEvent> events) {
+    BatchExecutionOutcome executeActions(ThreadId threadId,
+                                         TurnId turnId,
+                                         List<ToolActionRequest> actions,
+                                         List<TurnItem> items,
+                                         Consumer<TurnItem> itemConsumer) {
         List<Map<String, Object>> results = new ArrayList<>();
         List<String> approvalIds = new ArrayList<>();
         boolean awaitingApproval = false;
@@ -189,7 +300,7 @@ public class SpringAiCodexAgent implements CodexAgent {
             entry.put("index", index + 1);
             entry.put("action", action.action());
             entry.put("target", describeTarget(action));
-            ActionExecutionOutcome actionOutcome = executeAction(threadId, turnId, action, events);
+            ActionExecutionOutcome actionOutcome = executeAction(threadId, turnId, action, items, itemConsumer);
             entry.put("result", parseObservation(actionOutcome.observation()));
             results.add(entry);
             approvalIds.addAll(actionOutcome.approvalIds());
@@ -210,8 +321,12 @@ public class SpringAiCodexAgent implements CodexAgent {
         }
     }
 
-    ActionExecutionOutcome executeAction(ThreadId threadId, TurnId turnId, ToolActionRequest action, List<TurnEvent> events) {
-        events.add(turnEvent("tool.call", describe(action)));
+    ActionExecutionOutcome executeAction(ThreadId threadId,
+                                         TurnId turnId,
+                                         ToolActionRequest action,
+                                         List<TurnItem> items,
+                                         Consumer<TurnItem> itemConsumer) {
+        emitItem(items, itemConsumer, toolCallItem(action.action().name(), describeTarget(action)));
         String observation;
         try {
             observation = switch (action.action()) {
@@ -226,9 +341,9 @@ public class SpringAiCodexAgent implements CodexAgent {
         catch (Exception exception) {
             observation = createErrorObservation(exception.getMessage());
         }
-        ActionExecutionOutcome outcome = enrichApprovalObservation(threadId, turnId, action, observation, events);
+        ActionExecutionOutcome outcome = enrichApprovalObservation(threadId, turnId, action, observation, items, itemConsumer);
         observation = outcome.observation();
-        events.add(turnEvent("tool.result", summarizeToolResult(action.action(), observation)));
+        emitItem(items, itemConsumer, toolResultItem(action.action().name(), summarizeToolResult(action.action(), observation)));
         return outcome;
     }
 
@@ -238,42 +353,43 @@ public class SpringAiCodexAgent implements CodexAgent {
             JsonNode root = objectMapper.readTree(cleaned);
             String summary = firstNonBlank(textValue(root.get("summary")), textValue(root.get("thought")));
             String finalAnswer = textValue(root.get("finalAnswer"));
+            EditPlan editPlan = parseEditPlan(root.get("editPlan"));
             List<ToolActionRequest> actions = parseActions(root);
 
             if (!finalAnswer.isBlank()) {
                 if (!actions.isEmpty()) {
-                    return PlannerStep.invalid(summary, actions,
+                    return PlannerStep.invalid(summary, editPlan, actions,
                             "Return either actions or finalAnswer, but not both in the same planner step.");
                 }
-                return PlannerStep.finish(summary, finalAnswer);
+                return PlannerStep.finish(summary, editPlan, finalAnswer);
             }
 
             if (actions.isEmpty()) {
-                return PlannerStep.invalid(summary, List.of(),
+                return PlannerStep.invalid(summary, editPlan, List.of(),
                         "I could not determine any tool actions from the model response.");
             }
             if (actions.size() > maxActionsPerTurn) {
-                return PlannerStep.invalid(summary, actions,
+                return PlannerStep.invalid(summary, editPlan, actions,
                         "The model selected %d actions, exceeding the configured limit of %d."
                                 .formatted(actions.size(), maxActionsPerTurn));
             }
 
             String validationError = validateActions(actions);
             return validationError == null
-                    ? PlannerStep.actions(summary, actions)
-                    : PlannerStep.invalid(summary, actions, validationError);
+                    ? PlannerStep.actions(summary, editPlan, actions)
+                    : PlannerStep.invalid(summary, editPlan, actions, validationError);
         }
         catch (Exception exception) {
             String fallbackMessage = response == null || response.isBlank()
                     ? "I couldn't parse a valid planner step from the model response."
                     : response.trim();
-            return PlannerStep.invalid("The model returned a non-JSON response.", List.of(),
+            return PlannerStep.invalid("The model returned a non-JSON response.", null, List.of(),
                     "Invalid planner JSON response: " + fallbackMessage);
         }
     }
 
-    private String buildSystemPrompt() {
-        return """
+    String buildSystemPrompt(List<SkillMetadata> availableSkills) {
+        String basePrompt = """
                 You are Codex, a coding agent running inside a local workspace.
                 Workspace root: %s
 
@@ -290,6 +406,16 @@ public class SpringAiCodexAgent implements CodexAgent {
                 - Use this schema exactly:
                   {
                     "summary": "brief summary of the next step",
+                    "editPlan": {
+                      "summary": "optional edit plan for intended file changes",
+                      "edits": [
+                        {
+                          "path": "relative/path",
+                          "type": "CREATE | MODIFY | DELETE | VERIFY",
+                          "description": "what you intend to change"
+                        }
+                      ]
+                    },
                     "actions": [
                       {
                         "action": "READ_FILE | SEARCH_FILES | APPLY_PATCH | WRITE_FILE | RUN_COMMAND",
@@ -310,6 +436,7 @@ public class SpringAiCodexAgent implements CodexAgent {
                 - Omit unused fields or set them to null.
                 - Prefer SEARCH_FILES to locate code before reading full files.
                 - Prefer APPLY_PATCH for targeted edits and WRITE_FILE only for new files or full rewrites.
+                - Include editPlan whenever you expect to modify files.
                 - Read an existing file before editing it.
                 - Prefer inspection, tests, and small verified edits.
                 - Shell commands may be allowed, require approval, or be blocked. If a command is not executed, use the tool result to adapt.
@@ -317,19 +444,30 @@ public class SpringAiCodexAgent implements CodexAgent {
                 - Keep all paths relative to the workspace root.
                 - After each batch, use the observation from all executed actions before deciding the next step.
                 """.formatted(workspaceRoot, maxActionsPerTurn);
+        if (availableSkills == null || availableSkills.isEmpty()) {
+            return basePrompt;
+        }
+        return basePrompt + System.lineSeparator()
+                + """
+                Available skills:
+                %s
+
+                Skills are selected explicitly by user input, usually with `$skill-name`.
+                When a skill is selected, its instructions are injected into the turn context.
+                """.formatted(renderAvailableSkills(availableSkills));
     }
 
-    private String buildUserPrompt(ThreadId threadId, String input, String scratchpad, int step) {
-        List<org.dean.codex.protocol.conversation.ConversationMessage> messages = conversationStore.messages(threadId);
-        List<org.dean.codex.protocol.conversation.ConversationTurn> turns = conversationStore.turns(threadId);
-        int fromIndex = Math.max(0, messages.size() - historyWindow);
-        int turnFromIndex = Math.max(0, turns.size() - historyWindow);
-        String historyBlock = messages.subList(fromIndex, messages.size()).stream()
+    String buildUserPrompt(ReconstructedThreadContext reconstructedContext,
+                           String input,
+                           String scratchpad,
+                           int step,
+                           List<ResolvedSkill> selectedSkills,
+                           List<String> steeringInputs) {
+        String historyBlock = reconstructedContext.recentMessages().stream()
                 .map(message -> message.role().name() + ": " + message.content())
                 .collect(Collectors.joining(System.lineSeparator()));
-        String eventBlock = turns.subList(turnFromIndex, turns.size()).stream()
-                .flatMap(turn -> turn.events().stream()
-                        .map(event -> turn.turnId().value() + " " + event.type() + ": " + event.detail()))
+        String eventBlock = reconstructedContext.recentActivities().stream()
+                .map(activity -> reconstructedContext.threadId().value() + "/" + activity.turnId().value() + " " + renderActivityForPrompt(activity))
                 .collect(Collectors.joining(System.lineSeparator()));
 
         return """
@@ -344,6 +482,15 @@ public class SpringAiCodexAgent implements CodexAgent {
                 Recent turn events:
                 %s
 
+                Compacted thread memory:
+                %s
+
+                Selected skill instructions:
+                %s
+
+                Steering requests since last step:
+                %s
+
                 Latest user request:
                 %s
 
@@ -354,11 +501,23 @@ public class SpringAiCodexAgent implements CodexAgent {
                 """.formatted(
                 step,
                 maxSteps,
-                threadId.value(),
+                reconstructedContext.threadId().value(),
                 historyBlock.isBlank() ? "(none)" : historyBlock,
                 eventBlock.isBlank() ? "(none)" : eventBlock,
+                renderThreadMemory(reconstructedContext.threadMemory()),
+                renderSelectedSkills(selectedSkills),
+                steeringInputs == null || steeringInputs.isEmpty() ? "(none)" : String.join(System.lineSeparator(), steeringInputs),
                 input,
                 scratchpad.isBlank() ? "(none yet)" : scratchpad);
+    }
+
+    private String renderThreadMemory(ThreadMemory threadMemory) {
+        if (threadMemory == null || threadMemory.summary() == null || threadMemory.summary().isBlank()) {
+            return "(none)";
+        }
+        return "Memory " + threadMemory.memoryId() + " (" + threadMemory.compactedTurnCount() + " turns):"
+                + System.lineSeparator()
+                + threadMemory.summary();
     }
 
     private String describeActions(List<ToolActionRequest> actions) {
@@ -402,6 +561,34 @@ public class SpringAiCodexAgent implements CodexAgent {
                 if (root.has("scope") && !root.path("scope").asText("").isBlank()) {
                     summary.append(" scope=").append(root.path("scope").asText());
                 }
+                if (root.has("branch") && !root.path("branch").asText("").isBlank()) {
+                    summary.append(" branch=").append(root.path("branch").asText());
+                }
+                if (root.has("stagedCount")) {
+                    summary.append(" staged=").append(root.path("stagedCount").asInt());
+                }
+                if (root.has("commitHash") && !root.path("commitHash").asText("").isBlank()) {
+                    summary.append(" commit=").append(root.path("commitHash").asText(), 0,
+                            Math.min(8, root.path("commitHash").asText().length()));
+                }
+                if (root.has("clean")) {
+                    summary.append(" clean=").append(root.path("clean").asBoolean());
+                }
+                if (root.has("entries") && root.path("entries").isArray()) {
+                    summary.append(" entries=").append(root.path("entries").size());
+                }
+                if (root.has("committedEntries") && root.path("committedEntries").isArray()) {
+                    summary.append(" committed=").append(root.path("committedEntries").size());
+                }
+                if (root.has("target") && !root.path("target").asText("").isBlank()) {
+                    summary.append(" target=").append(root.path("target").asText());
+                }
+                if (root.has("reference") && !root.path("reference").asText("").isBlank()) {
+                    summary.append(" reference=").append(root.path("reference").asText());
+                }
+                if (root.has("totalCharacters")) {
+                    summary.append(" chars=").append(root.path("totalCharacters").asInt());
+                }
                 if (root.has("totalMatches")) {
                     summary.append(" matches=").append(root.path("totalMatches").asInt());
                 }
@@ -420,6 +607,9 @@ public class SpringAiCodexAgent implements CodexAgent {
                 if (root.has("timedOut") && root.path("timedOut").asBoolean()) {
                     summary.append(" timedOut=true");
                 }
+                if (root.has("truncated") && root.path("truncated").asBoolean()) {
+                    summary.append(" truncated=true");
+                }
                 return summary.toString();
             }
         }
@@ -433,7 +623,8 @@ public class SpringAiCodexAgent implements CodexAgent {
                                                              TurnId turnId,
                                                              ToolActionRequest action,
                                                              String observation,
-                                                             List<TurnEvent> events) {
+                                                             List<TurnItem> items,
+                                                             Consumer<TurnItem> itemConsumer) {
         if (action != null && action.action() != ToolAction.RUN_COMMAND) {
             return new ActionExecutionOutcome(observation, false, List.of());
         }
@@ -455,16 +646,21 @@ public class SpringAiCodexAgent implements CodexAgent {
                         objectNode.path("workingDirectory").asText(""),
                         reason);
                 objectNode.put("approvalRequestId", request.approvalId().value());
-                events.add(turnEvent("approval.required",
-                        "Approval " + shortApprovalId(request.approvalId().value())
-                                + " required for command: " + action.command()));
+                emitItem(items, itemConsumer, approvalItem(
+                        ApprovalState.REQUIRED,
+                        request.approvalId().value(),
+                        action.command(),
+                        "Approval " + shortApprovalId(request.approvalId().value()) + " required for command: " + action.command()));
                 return new ActionExecutionOutcome(
                         objectMapper.writeValueAsString(objectNode),
                         true,
                         List.of(request.approvalId().value()));
             }
             if (CommandApprovalDecision.BLOCK.name().equals(decision) && !executed) {
-                events.add(turnEvent("approval.blocked",
+                emitItem(items, itemConsumer, approvalItem(
+                        ApprovalState.BLOCKED,
+                        "",
+                        action.command(),
                         "Command blocked: " + (reason.isBlank() ? "No reason provided." : reason)));
             }
         }
@@ -522,6 +718,28 @@ public class SpringAiCodexAgent implements CodexAgent {
         return "{\"success\":false,\"error\":\"" + escapeForJson(error) + "\"}";
     }
 
+    private String summarizeEditPlan(EditPlan editPlan) {
+        if (editPlan == null || editPlan.edits().isEmpty()) {
+            return "(none)";
+        }
+        String summary = blankToPlaceholder(editPlan.summary());
+        String edits = editPlan.edits().stream()
+                .map(edit -> edit.type() + " " + blankToPlaceholder(edit.path()) + ": " + blankToPlaceholder(edit.description()))
+                .collect(Collectors.joining("; "));
+        return summary + " | " + edits;
+    }
+
+    private void emitItem(List<TurnItem> items, Consumer<TurnItem> itemConsumer, TurnItem item) {
+        items.add(item);
+        if (itemConsumer != null) {
+            itemConsumer.accept(item);
+        }
+    }
+
+    private String renderActivityForPrompt(ReconstructedTurnActivity activity) {
+        return blankToPlaceholder(activity.sourceType()) + ": " + blankToPlaceholder(activity.detail());
+    }
+
     private List<ToolActionRequest> parseActions(JsonNode root) {
         if (root == null || root.isMissingNode()) {
             return List.of();
@@ -543,6 +761,49 @@ public class SpringAiCodexAgent implements CodexAgent {
         return legacyAction == null ? List.of() : List.of(legacyAction);
     }
 
+    private EditPlan parseEditPlan(JsonNode planNode) {
+        if (planNode == null || planNode.isMissingNode() || planNode.isNull()) {
+            return null;
+        }
+
+        String summary = textValue(planNode.get("summary"));
+        JsonNode editsNode = planNode.get("edits");
+        if (editsNode == null || !editsNode.isArray()) {
+            return summary.isBlank() ? null : new EditPlan(summary, List.of());
+        }
+
+        List<PlannedEdit> edits = new ArrayList<>();
+        for (JsonNode editNode : editsNode) {
+            PlannedEdit edit = parsePlannedEdit(editNode);
+            if (edit != null) {
+                edits.add(edit);
+            }
+        }
+        return summary.isBlank() && edits.isEmpty() ? null : new EditPlan(summary, edits);
+    }
+
+    private PlannedEdit parsePlannedEdit(JsonNode editNode) {
+        if (editNode == null || editNode.isMissingNode() || editNode.isNull()) {
+            return null;
+        }
+
+        String path = textValue(editNode.get("path"));
+        String description = firstNonBlank(textValue(editNode.get("description")), textValue(editNode.get("intent")));
+        String typeText = textValue(editNode.get("type"));
+        PlannedEditType type;
+        try {
+            type = typeText.isBlank() ? PlannedEditType.MODIFY : PlannedEditType.valueOf(typeText.trim().toUpperCase(Locale.ROOT));
+        }
+        catch (IllegalArgumentException exception) {
+            type = PlannedEditType.MODIFY;
+        }
+
+        if (path.isBlank() && description.isBlank()) {
+            return null;
+        }
+        return new PlannedEdit(path, type, description);
+    }
+
     private ToolActionRequest parseAction(JsonNode actionNode) {
         if (actionNode == null || actionNode.isMissingNode()) {
             return null;
@@ -555,7 +816,7 @@ public class SpringAiCodexAgent implements CodexAgent {
 
         try {
             return new ToolActionRequest(
-                    ToolAction.valueOf(actionText),
+                    ToolAction.valueOf(actionText.trim().toUpperCase(Locale.ROOT)),
                     textValue(actionNode.get("path")),
                     textValue(actionNode.get("query")),
                     textValue(actionNode.get("oldText")),
@@ -615,8 +876,28 @@ public class SpringAiCodexAgent implements CodexAgent {
         return node == null || node.isNull() ? "" : node.asText("");
     }
 
-    private TurnEvent turnEvent(String type, String detail) {
-        return new TurnEvent(new ItemId(UUID.randomUUID().toString()), type, detail, Instant.now());
+    private AgentMessageItem agentMessageItem(String text) {
+        return new AgentMessageItem(new ItemId(UUID.randomUUID().toString()), text, Instant.now());
+    }
+
+    private PlanItem planItem(EditPlan editPlan) {
+        return new PlanItem(new ItemId(UUID.randomUUID().toString()), editPlan, Instant.now());
+    }
+
+    private ToolCallItem toolCallItem(String toolName, String target) {
+        return new ToolCallItem(new ItemId(UUID.randomUUID().toString()), toolName, target, Instant.now());
+    }
+
+    private ToolResultItem toolResultItem(String toolName, String summary) {
+        return new ToolResultItem(new ItemId(UUID.randomUUID().toString()), toolName, summary, Instant.now());
+    }
+
+    private ApprovalItem approvalItem(ApprovalState state, String approvalId, String command, String detail) {
+        return new ApprovalItem(new ItemId(UUID.randomUUID().toString()), state, approvalId, command, detail, Instant.now());
+    }
+
+    private RuntimeErrorItem runtimeErrorItem(String message) {
+        return new RuntimeErrorItem(new ItemId(UUID.randomUUID().toString()), message, Instant.now());
     }
 
     enum ToolAction {
@@ -638,20 +919,21 @@ public class SpringAiCodexAgent implements CodexAgent {
     }
 
     record PlannerStep(String summary,
+                       EditPlan editPlan,
                        List<ToolActionRequest> actions,
                        String finalAnswer,
                        String validationError) {
 
-        static PlannerStep actions(String summary, List<ToolActionRequest> actions) {
-            return new PlannerStep(summary, List.copyOf(actions), null, null);
+        static PlannerStep actions(String summary, EditPlan editPlan, List<ToolActionRequest> actions) {
+            return new PlannerStep(summary, editPlan, List.copyOf(actions), null, null);
         }
 
-        static PlannerStep finish(String summary, String finalAnswer) {
-            return new PlannerStep(summary, List.of(), finalAnswer, null);
+        static PlannerStep finish(String summary, EditPlan editPlan, String finalAnswer) {
+            return new PlannerStep(summary, editPlan, List.of(), finalAnswer, null);
         }
 
-        static PlannerStep invalid(String summary, List<ToolActionRequest> actions, String validationError) {
-            return new PlannerStep(summary, List.copyOf(actions), null, validationError);
+        static PlannerStep invalid(String summary, EditPlan editPlan, List<ToolActionRequest> actions, String validationError) {
+            return new PlannerStep(summary, editPlan, List.copyOf(actions), null, validationError);
         }
 
         boolean isFinished() {
@@ -659,7 +941,39 @@ public class SpringAiCodexAgent implements CodexAgent {
         }
     }
 
-    private record ExecutionOutcome(TurnStatus status, List<TurnEvent> events, String finalAnswer) {
+    private record ExecutionOutcome(TurnStatus status, List<TurnItem> items, String finalAnswer) {
+    }
+
+    List<ResolvedSkill> selectedSkillsForInput(String input) {
+        return skillService.resolveSkills(input, false);
+    }
+
+    private SkillUseItem skillUseItem(List<SkillMetadata> selectedSkills) {
+        return new SkillUseItem(new ItemId(UUID.randomUUID().toString()), selectedSkills, Instant.now());
+    }
+
+    private String renderAvailableSkills(List<SkillMetadata> availableSkills) {
+        return availableSkills.stream()
+                .map(skill -> "- %s: %s (file: %s)"
+                        .formatted(skill.name(), blankToPlaceholder(skill.shortDescription()), skill.path()))
+                .collect(Collectors.joining(System.lineSeparator()));
+    }
+
+    private String renderSelectedSkills(List<ResolvedSkill> selectedSkills) {
+        if (selectedSkills == null || selectedSkills.isEmpty()) {
+            return "(none)";
+        }
+        return selectedSkills.stream()
+                .map(skill -> """
+                        Skill: %s
+                        Path: %s
+                        Instructions:
+                        %s
+                        """.formatted(
+                        skill.metadata().name(),
+                        skill.metadata().path(),
+                        skill.instructions().trim()))
+                .collect(Collectors.joining(System.lineSeparator()));
     }
 
     private record BatchExecutionOutcome(String observation, boolean awaitingApproval, List<String> approvalIds) {

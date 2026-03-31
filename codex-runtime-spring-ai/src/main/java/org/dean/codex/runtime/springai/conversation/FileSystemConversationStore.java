@@ -8,6 +8,7 @@ import org.dean.codex.protocol.conversation.ThreadSummary;
 import org.dean.codex.protocol.conversation.TurnId;
 import org.dean.codex.protocol.conversation.TurnStatus;
 import org.dean.codex.protocol.event.TurnEvent;
+import org.dean.codex.protocol.item.TurnItem;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -76,6 +77,7 @@ public class FileSystemConversationStore implements ConversationStore {
                 TurnStatus.RUNNING,
                 startedAt == null ? Instant.now() : startedAt,
                 null,
+                List.of(),
                 List.of());
         try {
             writeJson(turnFile(threadId, turnId), turn);
@@ -102,7 +104,8 @@ public class FileSystemConversationStore implements ConversationStore {
                 turn.status(),
                 turn.startedAt(),
                 turn.completedAt(),
-                Stream.concat(turn.events().stream(), events.stream()).toList());
+                Stream.concat(turn.events().stream(), events.stream()).toList(),
+                turn.items());
         try {
             writeJson(turnFile(threadId, turnId), updatedTurn);
             Instant updatedAt = events.get(events.size() - 1).createdAt();
@@ -110,6 +113,33 @@ public class FileSystemConversationStore implements ConversationStore {
         }
         catch (IOException exception) {
             throw new IllegalStateException("Unable to append events to turn " + turnId.value(), exception);
+        }
+    }
+
+    @Override
+    public synchronized void appendTurnItems(ThreadId threadId, TurnId turnId, List<TurnItem> items) {
+        requireThread(threadId);
+        if (items == null || items.isEmpty()) {
+            return;
+        }
+        ConversationTurn turn = readTurn(threadId, turnId);
+        ConversationTurn updatedTurn = new ConversationTurn(
+                turn.turnId(),
+                turn.threadId(),
+                turn.userInput(),
+                turn.finalAnswer(),
+                turn.status(),
+                turn.startedAt(),
+                turn.completedAt(),
+                turn.events(),
+                Stream.concat(turn.items().stream(), items.stream()).toList());
+        try {
+            writeJson(turnFile(threadId, turnId), updatedTurn);
+            Instant updatedAt = items.get(items.size() - 1).createdAt();
+            touchThread(threadId, updatedAt == null ? Instant.now() : updatedAt);
+        }
+        catch (IOException exception) {
+            throw new IllegalStateException("Unable to append items to turn " + turnId.value(), exception);
         }
     }
 
@@ -124,8 +154,9 @@ public class FileSystemConversationStore implements ConversationStore {
                 turn.finalAnswer(),
                 status == null ? turn.status() : status,
                 turn.startedAt(),
-                status == TurnStatus.COMPLETED || status == TurnStatus.FAILED ? (updatedAt == null ? Instant.now() : updatedAt) : null,
-                turn.events());
+                isTerminal(status) ? (updatedAt == null ? Instant.now() : updatedAt) : null,
+                turn.events(),
+                turn.items());
         try {
             writeJson(turnFile(threadId, turnId), updatedTurn);
             touchThread(threadId, updatedAt == null ? Instant.now() : updatedAt);
@@ -147,7 +178,8 @@ public class FileSystemConversationStore implements ConversationStore {
                 status == null ? TurnStatus.COMPLETED : status,
                 turn.startedAt(),
                 completedAt == null ? Instant.now() : completedAt,
-                turn.events());
+                turn.events(),
+                turn.items());
         try {
             writeJson(turnFile(threadId, turnId), updatedTurn);
             touchThread(threadId, updatedTurn.completedAt());
@@ -274,6 +306,12 @@ public class FileSystemConversationStore implements ConversationStore {
 
     private Path turnFile(ThreadId threadId, TurnId turnId) {
         return turnsDirectory(threadId).resolve(turnId.value() + ".json");
+    }
+
+    private boolean isTerminal(TurnStatus status) {
+        return status == TurnStatus.COMPLETED
+                || status == TurnStatus.FAILED
+                || status == TurnStatus.INTERRUPTED;
     }
 
     private record ThreadMetadata(String threadId, String title, Instant createdAt, Instant updatedAt) {

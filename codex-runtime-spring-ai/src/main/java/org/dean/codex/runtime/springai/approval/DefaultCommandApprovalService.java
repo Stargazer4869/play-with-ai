@@ -10,13 +10,12 @@ import org.dean.codex.protocol.approval.CommandApprovalRequest;
 import org.dean.codex.protocol.conversation.ItemId;
 import org.dean.codex.protocol.conversation.ThreadId;
 import org.dean.codex.protocol.conversation.TurnId;
-import org.dean.codex.protocol.event.TurnEvent;
+import org.dean.codex.protocol.item.ApprovalItem;
+import org.dean.codex.protocol.item.ApprovalState;
 import org.dean.codex.protocol.tool.ShellCommandResult;
 
 import java.time.Instant;
 import java.util.List;
-import java.util.UUID;
-
 public class DefaultCommandApprovalService implements CommandApprovalService {
 
     private final CommandApprovalStore commandApprovalStore;
@@ -68,9 +67,10 @@ public class DefaultCommandApprovalService implements CommandApprovalService {
                 "Approved from CLI.",
                 result);
         commandApprovalStore.save(approvedRequest);
-        conversationStore.appendTurnEvents(threadId, request.turnId(), List.of(
-                turnEvent("approval.approved", "Approved command " + shortApprovalId(request.approvalId()) + ": " + request.command(), now),
-                turnEvent("approval.result", summarizeApprovedResult(result), now)
+        conversationStore.appendTurnItems(threadId, request.turnId(), List.of(
+                approvalItem(ApprovalState.APPROVED, request.approvalId(), request.command(),
+                        "Approved command " + shortApprovalId(request.approvalId()) + ": " + request.command(), now),
+                approvalItem(ApprovalState.RESULT, request.approvalId(), request.command(), summarizeApprovedResult(result), now)
         ));
         return approvedRequest;
     }
@@ -93,8 +93,9 @@ public class DefaultCommandApprovalService implements CommandApprovalService {
                 note,
                 null);
         commandApprovalStore.save(rejectedRequest);
-        conversationStore.appendTurnEvents(threadId, request.turnId(), List.of(
-                turnEvent("approval.rejected", "Rejected command " + shortApprovalId(request.approvalId()) + ": " + note, now)
+        conversationStore.appendTurnItems(threadId, request.turnId(), List.of(
+                approvalItem(ApprovalState.REJECTED, request.approvalId(), request.command(),
+                        "Rejected command " + shortApprovalId(request.approvalId()) + ": " + note, now)
         ));
         return rejectedRequest;
     }
@@ -106,7 +107,7 @@ public class DefaultCommandApprovalService implements CommandApprovalService {
                                                         String reason) {
         Instant now = Instant.now();
         CommandApprovalRequest request = new CommandApprovalRequest(
-                new ApprovalId(UUID.randomUUID().toString()),
+                new ApprovalId(java.util.UUID.randomUUID().toString()),
                 threadId,
                 turnId,
                 command,
@@ -139,8 +140,18 @@ public class DefaultCommandApprovalService implements CommandApprovalService {
         return matches.get(0);
     }
 
-    private TurnEvent turnEvent(String type, String detail, Instant createdAt) {
-        return new TurnEvent(new ItemId(UUID.randomUUID().toString()), type, detail, createdAt);
+    private ApprovalItem approvalItem(ApprovalState state,
+                                      ApprovalId approvalId,
+                                      String command,
+                                      String detail,
+                                      Instant createdAt) {
+        return new ApprovalItem(
+                new ItemId(java.util.UUID.randomUUID().toString()),
+                state,
+                approvalId == null ? "" : approvalId.value(),
+                command == null ? "" : command,
+                detail,
+                createdAt);
     }
 
     private String summarizeApprovedResult(ShellCommandResult result) {

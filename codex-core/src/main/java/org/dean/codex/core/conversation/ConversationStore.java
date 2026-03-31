@@ -7,6 +7,7 @@ import org.dean.codex.protocol.conversation.ThreadSummary;
 import org.dean.codex.protocol.conversation.TurnId;
 import org.dean.codex.protocol.conversation.TurnStatus;
 import org.dean.codex.protocol.event.TurnEvent;
+import org.dean.codex.protocol.item.TurnItem;
 
 import java.time.Instant;
 import java.util.List;
@@ -21,6 +22,8 @@ public interface ConversationStore {
     TurnId startTurn(ThreadId threadId, String userInput, Instant startedAt);
 
     void appendTurnEvents(ThreadId threadId, TurnId turnId, List<TurnEvent> events);
+
+    void appendTurnItems(ThreadId threadId, TurnId turnId, List<TurnItem> items);
 
     void updateTurnStatus(ThreadId threadId, TurnId turnId, TurnStatus status, Instant updatedAt);
 
