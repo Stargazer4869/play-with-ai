@@ -111,6 +111,6 @@ The current implementation has already moved beyond the initial module split:
 
 ## Next Likely Phases
 
-- richer tool surface such as git and structured patch planning
+- richer tool surface such as structured edit planning and command-driven repository workflows
 - protocol/event streaming for future app-server integrations
 - sandboxing and policy controls

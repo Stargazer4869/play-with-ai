@@ -6,6 +6,8 @@ import org.dean.codex.core.tool.local.ShellCommandTool;
 import org.dean.codex.protocol.approval.ApprovalStatus;
 import org.dean.codex.protocol.conversation.ThreadId;
 import org.dean.codex.protocol.conversation.TurnId;
+import org.dean.codex.protocol.item.ApprovalItem;
+import org.dean.codex.protocol.item.ApprovalState;
 import org.dean.codex.protocol.tool.CommandApprovalDecision;
 import org.dean.codex.protocol.tool.ShellCommandResult;
 import org.junit.jupiter.api.Test;
@@ -23,7 +25,7 @@ class DefaultCommandApprovalServiceTest {
     Path storageRoot;
 
     @Test
-    void approveExecutesCommandAndAppendsTurnEvents() {
+    void approveExecutesCommandAndAppendsTurnItems() {
         ConversationStore conversationStore = new InMemoryConversationStore();
         ThreadId threadId = conversationStore.createThread("Approval thread");
         TurnId turnId = conversationStore.startTurn(threadId, "run tests", Instant.now());
@@ -38,10 +40,14 @@ class DefaultCommandApprovalServiceTest {
 
         assertEquals(ApprovalStatus.APPROVED, approved.status());
         assertTrue(approved.executionResult().executed());
-        assertTrue(conversationStore.turns(threadId).get(0).events().stream()
-                .anyMatch(event -> event.type().equals("approval.approved")));
-        assertTrue(conversationStore.turns(threadId).get(0).events().stream()
-                .anyMatch(event -> event.type().equals("approval.result")));
+        assertTrue(conversationStore.turns(threadId).get(0).items().stream()
+                .filter(ApprovalItem.class::isInstance)
+                .map(ApprovalItem.class::cast)
+                .anyMatch(item -> item.state() == ApprovalState.APPROVED));
+        assertTrue(conversationStore.turns(threadId).get(0).items().stream()
+                .filter(ApprovalItem.class::isInstance)
+                .map(ApprovalItem.class::cast)
+                .anyMatch(item -> item.state() == ApprovalState.RESULT));
     }
 
     @Test
@@ -59,8 +65,10 @@ class DefaultCommandApprovalServiceTest {
         var rejected = service.reject(threadId, request.approvalId().value().substring(0, 8), "Not now");
 
         assertEquals(ApprovalStatus.REJECTED, rejected.status());
-        assertTrue(conversationStore.turns(threadId).get(0).events().stream()
-                .anyMatch(event -> event.type().equals("approval.rejected")));
+        assertTrue(conversationStore.turns(threadId).get(0).items().stream()
+                .filter(ApprovalItem.class::isInstance)
+                .map(ApprovalItem.class::cast)
+                .anyMatch(item -> item.state() == ApprovalState.REJECTED));
     }
 
     private static final class StubShellCommandTool implements ShellCommandTool {

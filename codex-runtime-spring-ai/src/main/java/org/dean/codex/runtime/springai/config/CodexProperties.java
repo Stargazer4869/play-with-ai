@@ -9,6 +9,8 @@ public class CodexProperties {
     private String storageRoot = "";
     private final Agent agent = new Agent();
     private final Shell shell = new Shell();
+    private final Skills skills = new Skills();
+    private final Context context = new Context();
 
     public String getWorkspaceRoot() {
         return workspaceRoot;
@@ -32,6 +34,14 @@ public class CodexProperties {
 
     public Shell getShell() {
         return shell;
+    }
+
+    public Skills getSkills() {
+        return skills;
+    }
+
+    public Context getContext() {
+        return context;
     }
 
     public static class Agent {
@@ -82,6 +92,48 @@ public class CodexProperties {
 
         public void setTimeoutSeconds(int timeoutSeconds) {
             this.timeoutSeconds = timeoutSeconds;
+        }
+    }
+
+    public static class Skills {
+        private boolean enabled = true;
+        private String userRoot = "";
+        private String workspaceRelativeRoot = ".codex/skills";
+
+        public boolean isEnabled() {
+            return enabled;
+        }
+
+        public void setEnabled(boolean enabled) {
+            this.enabled = enabled;
+        }
+
+        public String getUserRoot() {
+            return userRoot;
+        }
+
+        public void setUserRoot(String userRoot) {
+            this.userRoot = userRoot;
+        }
+
+        public String getWorkspaceRelativeRoot() {
+            return workspaceRelativeRoot;
+        }
+
+        public void setWorkspaceRelativeRoot(String workspaceRelativeRoot) {
+            this.workspaceRelativeRoot = workspaceRelativeRoot;
+        }
+    }
+
+    public static class Context {
+        private int preserveRecentTurns = 4;
+
+        public int getPreserveRecentTurns() {
+            return preserveRecentTurns;
+        }
+
+        public void setPreserveRecentTurns(int preserveRecentTurns) {
+            this.preserveRecentTurns = preserveRecentTurns;
         }
     }
 }

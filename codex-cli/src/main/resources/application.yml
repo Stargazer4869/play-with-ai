@@ -7,9 +7,19 @@ spring:
 codex:
   workspace-root: ${user.dir}
   storage-root: ${user.home}/.codex-java
+  cli:
+    app-server:
+      main-class: ${CODEX_APP_SERVER_MAIN_CLASS:org.dean.codex.runtime.springai.appserver.CodexAppServerStdioApplication}
+      request-timeout-seconds: ${CODEX_APP_SERVER_TIMEOUT_SECONDS:30}
   shell:
     approval-mode: ${CODEX_SHELL_APPROVAL_MODE:review-sensitive}
     timeout-seconds: ${CODEX_SHELL_TIMEOUT_SECONDS:60}
+  skills:
+    enabled: ${CODEX_SKILLS_ENABLED:true}
+    user-root: ${CODEX_USER_SKILLS_ROOT:${user.home}/.codex/skills}
+    workspace-relative-root: ${CODEX_WORKSPACE_SKILLS_ROOT:.codex/skills}
+  context:
+    preserve-recent-turns: ${CODEX_CONTEXT_PRESERVE_RECENT_TURNS:4}
   agent:
     max-steps: 100
     max-actions-per-turn: 3
