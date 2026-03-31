@@ -14,3 +14,7 @@ spring:
         options:
           model: ${CODEX_CHAT_MODEL:gpt-5.4}
           temperature: ${CODEX_TEMPERATURE:0.2}
+codex:
+  model:
+    context-window: ${CODEX_CONTEXT_WINDOW:0}
+    auto-compact-token-limit: ${CODEX_AUTO_COMPACT_TOKEN_LIMIT:0}

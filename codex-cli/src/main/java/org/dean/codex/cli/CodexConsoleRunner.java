@@ -10,7 +10,10 @@ import org.dean.codex.protocol.appserver.AppServerNotification;
 import org.dean.codex.protocol.appserver.InitializeParams;
 import org.dean.codex.protocol.appserver.InitializedNotification;
 import org.dean.codex.protocol.appserver.SkillsListParams;
+import org.dean.codex.protocol.appserver.ThreadCompaction;
 import org.dean.codex.protocol.appserver.ThreadCompactStartParams;
+import org.dean.codex.protocol.appserver.ThreadCompactionStartedNotification;
+import org.dean.codex.protocol.appserver.ThreadCompactedNotification;
 import org.dean.codex.protocol.appserver.ThreadReadParams;
 import org.dean.codex.protocol.appserver.ThreadReadResponse;
 import org.dean.codex.protocol.appserver.ThreadResumeParams;
@@ -53,6 +56,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Scanner;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 @Component
 public class CodexConsoleRunner implements CommandLineRunner {
@@ -298,11 +302,20 @@ public class CodexConsoleRunner implements CommandLineRunner {
     }
 
     private void compactThread() {
-        ThreadMemory threadMemory = appServerSession.threadCompactStart(new ThreadCompactStartParams(activeThreadId)).threadMemory();
-        System.out.printf("Compacted thread memory %s from %d turns.%n",
-                threadMemory.memoryId(),
-                threadMemory.compactedTurnCount());
-        printThreadMemory(threadMemory);
+        try (CompactionNotificationSession session = new CompactionNotificationSession(activeThreadId)) {
+            var response = appServerSession.threadCompactStart(new ThreadCompactStartParams(activeThreadId));
+            session.attach(response.compaction());
+            session.awaitCompletion();
+            if (response.compaction() != null) {
+                printCompactionResponse(response.compaction(), response.threadMemory());
+            }
+            else if (response.threadMemory() != null) {
+                printThreadMemory(response.threadMemory());
+            }
+        }
+        catch (Exception exception) {
+            throw new IllegalStateException("Failed to compact the active thread.", exception);
+        }
     }
 
     private void printThreadMemory(ThreadMemory threadMemory) {
@@ -311,6 +324,49 @@ public class CodexConsoleRunner implements CommandLineRunner {
                 TIMESTAMP_FORMAT.format(threadMemory.createdAt()));
         if (threadMemory.summary() != null && !threadMemory.summary().isBlank()) {
             System.out.println(threadMemory.summary());
+        }
+    }
+
+    private void printCompactionNotification(AppServerNotification notification) {
+        if (notification instanceof ThreadCompactionStartedNotification started) {
+            printCompactionStarted(started.compaction());
+            return;
+        }
+        if (notification instanceof ThreadCompactedNotification completed) {
+            printCompactionCompleted(completed.compaction());
+        }
+    }
+
+    private void printCompactionStarted(ThreadCompaction compaction) {
+        if (compaction == null) {
+            return;
+        }
+        System.out.printf("[compaction] started %s on thread %s%n",
+                shortCompactionId(compaction),
+                shortThreadId(compaction.threadId()));
+    }
+
+    private void printCompactionCompleted(ThreadCompaction compaction) {
+        if (compaction == null) {
+            return;
+        }
+        System.out.printf("[compaction] completed %s from %d turns at %s%n",
+                shortCompactionId(compaction),
+                compaction.compactedTurnCount(),
+                compaction.completedAt() == null ? "(unknown)" : TIMESTAMP_FORMAT.format(compaction.completedAt()));
+        if (compaction.summary() != null && !compaction.summary().isBlank()) {
+            System.out.println(compaction.summary());
+        }
+    }
+
+    private void printCompactionResponse(ThreadCompaction compaction, ThreadMemory threadMemory) {
+        System.out.printf("[compaction] response %s from %d turns%n",
+                shortCompactionId(compaction),
+                compaction.compactedTurnCount());
+        if (threadMemory != null) {
+            System.out.printf("[memory] compatibility snapshot %s at %s%n",
+                    threadMemory.memoryId(),
+                    TIMESTAMP_FORMAT.format(threadMemory.createdAt()));
         }
     }
 
@@ -410,6 +466,11 @@ public class CodexConsoleRunner implements CommandLineRunner {
 
     private String shortThreadId(ThreadId threadId) {
         String value = threadId.value();
+        return value.length() <= 8 ? value : value.substring(0, 8);
+    }
+
+    private String shortCompactionId(ThreadCompaction compaction) {
+        String value = compaction.compactionId();
         return value.length() <= 8 ? value : value.substring(0, 8);
     }
 
@@ -544,6 +605,91 @@ public class CodexConsoleRunner implements CommandLineRunner {
                 printItem(itemNotification.item());
             }
             if (notification instanceof TurnCompletedNotification) {
+                completionLatch.countDown();
+            }
+        }
+
+        @Override
+        public void close() throws Exception {
+            subscription.close();
+        }
+    }
+
+    private final class CompactionNotificationSession implements AutoCloseable {
+
+        private final CountDownLatch completionLatch = new CountDownLatch(1);
+        private final List<AppServerNotification> pendingNotifications = new ArrayList<>();
+        private final AutoCloseable subscription;
+        private final ThreadId threadId;
+        private String targetCompactionId;
+
+        private CompactionNotificationSession(ThreadId threadId) {
+            this.threadId = threadId;
+            try {
+                this.subscription = appServerSession.subscribe(this::onNotification);
+            }
+            catch (Exception exception) {
+                throw new IllegalStateException("Unable to subscribe to compaction notifications for thread "
+                        + shortThreadId(threadId), exception);
+            }
+        }
+
+        private synchronized void attach(ThreadCompaction compaction) {
+            if (compaction == null) {
+                completionLatch.countDown();
+                return;
+            }
+            this.targetCompactionId = compaction.compactionId();
+            for (AppServerNotification notification : pendingNotifications) {
+                if (matches(notification)) {
+                    process(notification);
+                }
+            }
+            pendingNotifications.clear();
+        }
+
+        private void awaitCompletion() {
+            try {
+                completionLatch.await(1, TimeUnit.SECONDS);
+            }
+            catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("Interrupted while waiting for compaction notifications.", exception);
+            }
+        }
+
+        private synchronized void onNotification(AppServerNotification notification) {
+            if (targetCompactionId == null) {
+                pendingNotifications.add(notification);
+                return;
+            }
+            if (!matches(notification)) {
+                return;
+            }
+            process(notification);
+        }
+
+        private boolean matches(AppServerNotification notification) {
+            if (notification instanceof ThreadCompactionStartedNotification started) {
+                return matches(started.compaction());
+            }
+            if (notification instanceof ThreadCompactedNotification completed) {
+                return matches(completed.compaction());
+            }
+            return false;
+        }
+
+        private boolean matches(ThreadCompaction compaction) {
+            return compaction != null
+                    && compaction.threadId() != null
+                    && compaction.threadId().equals(threadId)
+                    && targetCompactionId != null
+                    && targetCompactionId.equals(compaction.compactionId());
+        }
+
+        private void process(AppServerNotification notification) {
+            printCompactionNotification(notification);
+            if (notification instanceof ThreadCompactedNotification) {
                 completionLatch.countDown();
             }
         }

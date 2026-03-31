@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.dean.codex.core.approval.CommandApprovalService;
 import org.dean.codex.core.agent.CodexAgent;
 import org.dean.codex.core.agent.TurnControl;
+import org.dean.codex.core.context.ContextManager;
 import org.dean.codex.core.context.ThreadContextReconstructionService;
 import org.dean.codex.core.skill.ResolvedSkill;
 import org.dean.codex.core.skill.SkillService;
@@ -36,9 +37,9 @@ import org.dean.codex.protocol.item.UserMessageItem;
 import org.dean.codex.protocol.approval.CommandApprovalRequest;
 import org.dean.codex.protocol.context.ReconstructedThreadContext;
 import org.dean.codex.protocol.context.ReconstructedTurnActivity;
-import org.dean.codex.protocol.context.ThreadMemory;
 import org.dean.codex.protocol.skill.SkillMetadata;
 import org.dean.codex.protocol.tool.CommandApprovalDecision;
+import org.dean.codex.runtime.springai.config.CodexProperties;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.client.ChatClient;
@@ -72,11 +73,14 @@ public class SpringAiCodexAgent implements CodexAgent {
     private final ShellCommandTool shellCommandTool;
     private final CommandApprovalService commandApprovalService;
     private final ThreadContextReconstructionService threadContextReconstructionService;
+    private final ContextManager contextManager;
     private final SkillService skillService;
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final Path workspaceRoot;
     private final int maxSteps;
     private final int maxActionsPerTurn;
+    private final int autoCompactTokenLimit;
+    private final int contextWindow;
 
     @Autowired
     public SpringAiCodexAgent(ChatClient.Builder chatClientBuilder,
@@ -87,8 +91,10 @@ public class SpringAiCodexAgent implements CodexAgent {
                               ShellCommandTool shellCommandTool,
                               CommandApprovalService commandApprovalService,
                               ThreadContextReconstructionService threadContextReconstructionService,
+                              ContextManager contextManager,
                               SkillService skillService,
                               @Qualifier("codexWorkspaceRoot") Path workspaceRoot,
+                              CodexProperties codexProperties,
                               @Value("${codex.agent.max-steps:12}") int maxSteps,
                               @Value("${codex.agent.max-actions-per-turn:3}") int maxActionsPerTurn) {
         this.chatClient = chatClientBuilder.clone()
@@ -101,10 +107,14 @@ public class SpringAiCodexAgent implements CodexAgent {
         this.shellCommandTool = shellCommandTool;
         this.commandApprovalService = commandApprovalService;
         this.threadContextReconstructionService = threadContextReconstructionService;
+        this.contextManager = contextManager;
         this.skillService = skillService;
         this.workspaceRoot = workspaceRoot;
         this.maxSteps = Math.max(1, maxSteps);
         this.maxActionsPerTurn = Math.max(1, maxActionsPerTurn);
+        CodexProperties.Model model = codexProperties == null ? null : codexProperties.getModel();
+        this.autoCompactTokenLimit = model == null ? 0 : Math.max(0, model.getAutoCompactTokenLimit());
+        this.contextWindow = model == null ? 0 : Math.max(0, model.getContextWindow());
     }
 
     @Override
@@ -171,6 +181,7 @@ public class SpringAiCodexAgent implements CodexAgent {
         List<TurnItem> items = new ArrayList<>(preludeItems);
         StringBuilder scratchpad = new StringBuilder();
         String lastObservation = "(none)";
+        boolean skipNextPreSamplingAutoCompaction = false;
 
         for (int step = 1; step <= maxSteps; step++) {
             if (turnControl.interruptionRequested()) {
@@ -180,6 +191,19 @@ public class SpringAiCodexAgent implements CodexAgent {
             if (!steeringInputs.isEmpty()) {
                 steeringInputs.forEach(steeringInput ->
                         emitItem(items, itemConsumer, new UserMessageItem(new ItemId(UUID.randomUUID().toString()), steeringInput, Instant.now())));
+            }
+            if (skipNextPreSamplingAutoCompaction) {
+                skipNextPreSamplingAutoCompaction = false;
+            }
+            else {
+                maybeAutoCompactBeforeSampling(
+                        threadId,
+                        input,
+                        scratchpad.toString(),
+                        step,
+                        selectedSkills,
+                        availableSkills,
+                        steeringInputs);
             }
             PlannerStep decision = requestDecision(
                     threadId,
@@ -240,6 +264,18 @@ public class SpringAiCodexAgent implements CodexAgent {
             if (turnControl.interruptionRequested()) {
                 return interruptedOutcome(items, itemConsumer);
             }
+            boolean compacted = maybeAutoCompactAfterActions(
+                    threadId,
+                    input,
+                    scratchpad.toString(),
+                    step + 1,
+                    selectedSkills,
+                    availableSkills,
+                    List.of());
+            if (compacted) {
+                skipNextPreSamplingAutoCompaction = true;
+                continue;
+            }
         }
 
         emitItem(items, itemConsumer, runtimeErrorItem("Stopped after " + maxSteps + " planner steps."));
@@ -261,13 +297,13 @@ public class SpringAiCodexAgent implements CodexAgent {
                 finalAnswer);
     }
 
-    private PlannerStep requestDecision(ThreadId threadId,
-                                        String input,
-                                        String scratchpad,
-                                        int step,
-                                        List<ResolvedSkill> selectedSkills,
-                                        List<SkillMetadata> availableSkills,
-                                        List<String> steeringInputs) {
+    protected PlannerStep requestDecision(ThreadId threadId,
+                                          String input,
+                                          String scratchpad,
+                                          int step,
+                                          List<ResolvedSkill> selectedSkills,
+                                          List<SkillMetadata> availableSkills,
+                                          List<String> steeringInputs) {
         String systemPrompt = buildSystemPrompt(availableSkills);
         ReconstructedThreadContext reconstructedContext = threadContextReconstructionService.reconstruct(threadId);
         String userPrompt = buildUserPrompt(reconstructedContext, input, scratchpad, step, selectedSkills, steeringInputs);
@@ -284,6 +320,91 @@ public class SpringAiCodexAgent implements CodexAgent {
         logger.debug("Codex planner parsed step {} actions={} finished={} summary={}",
                 step, decision.actions().size(), decision.isFinished(), blankToPlaceholder(decision.summary()));
         return decision;
+    }
+
+    private boolean maybeAutoCompactBeforeSampling(ThreadId threadId,
+                                                   String input,
+                                                   String scratchpad,
+                                                   int step,
+                                                   List<ResolvedSkill> selectedSkills,
+                                                   List<SkillMetadata> availableSkills,
+                                                   List<String> steeringInputs) {
+        return maybeAutoCompact(threadId, input, scratchpad, step, selectedSkills, availableSkills, steeringInputs,
+                "before sampling");
+    }
+
+    private boolean maybeAutoCompactAfterActions(ThreadId threadId,
+                                                 String input,
+                                                 String scratchpad,
+                                                 int step,
+                                                 List<ResolvedSkill> selectedSkills,
+                                                 List<SkillMetadata> availableSkills,
+                                                 List<String> steeringInputs) {
+        return maybeAutoCompact(threadId, input, scratchpad, step, selectedSkills, availableSkills, steeringInputs,
+                "after actions");
+    }
+
+    private boolean maybeAutoCompact(ThreadId threadId,
+                                     String input,
+                                     String scratchpad,
+                                     int step,
+                                     List<ResolvedSkill> selectedSkills,
+                                     List<SkillMetadata> availableSkills,
+                                     List<String> steeringInputs,
+                                     String phase) {
+        int limit = effectiveAutoCompactTokenLimit();
+        if (limit <= 0) {
+            return false;
+        }
+
+        int estimatedTokens = estimatePlannerPromptTokens(
+                threadId,
+                input,
+                scratchpad,
+                step,
+                selectedSkills,
+                availableSkills,
+                steeringInputs);
+        if (estimatedTokens <= limit) {
+            return false;
+        }
+
+        logger.debug("Auto-compacting thread {} {} at step {}: estimatedTokens={} limit={}",
+                threadId.value(),
+                phase,
+                step,
+                estimatedTokens,
+                limit);
+        contextManager.compactThread(threadId);
+        return true;
+    }
+
+    private int estimatePlannerPromptTokens(ThreadId threadId,
+                                            String input,
+                                            String scratchpad,
+                                            int step,
+                                            List<ResolvedSkill> selectedSkills,
+                                            List<SkillMetadata> availableSkills,
+                                            List<String> steeringInputs) {
+        ReconstructedThreadContext reconstructedContext = threadContextReconstructionService.reconstruct(threadId);
+        String systemPrompt = buildSystemPrompt(availableSkills);
+        String userPrompt = buildUserPrompt(reconstructedContext, input, scratchpad, step, selectedSkills, steeringInputs);
+        return estimateTokens(systemPrompt) + estimateTokens(userPrompt);
+    }
+
+    private int effectiveAutoCompactTokenLimit() {
+        int limit = autoCompactTokenLimit;
+        if (contextWindow > 0) {
+            limit = limit <= 0 ? contextWindow : Math.min(limit, contextWindow);
+        }
+        return Math.max(0, limit);
+    }
+
+    private int estimateTokens(String text) {
+        if (text == null || text.isBlank()) {
+            return 0;
+        }
+        return Math.max(1, (text.length() + 3) / 4);
     }
 
     BatchExecutionOutcome executeActions(ThreadId threadId,
@@ -482,9 +603,6 @@ public class SpringAiCodexAgent implements CodexAgent {
                 Recent turn events:
                 %s
 
-                Compacted thread memory:
-                %s
-
                 Selected skill instructions:
                 %s
 
@@ -504,20 +622,10 @@ public class SpringAiCodexAgent implements CodexAgent {
                 reconstructedContext.threadId().value(),
                 historyBlock.isBlank() ? "(none)" : historyBlock,
                 eventBlock.isBlank() ? "(none)" : eventBlock,
-                renderThreadMemory(reconstructedContext.threadMemory()),
                 renderSelectedSkills(selectedSkills),
                 steeringInputs == null || steeringInputs.isEmpty() ? "(none)" : String.join(System.lineSeparator(), steeringInputs),
                 input,
                 scratchpad.isBlank() ? "(none yet)" : scratchpad);
-    }
-
-    private String renderThreadMemory(ThreadMemory threadMemory) {
-        if (threadMemory == null || threadMemory.summary() == null || threadMemory.summary().isBlank()) {
-            return "(none)";
-        }
-        return "Memory " + threadMemory.memoryId() + " (" + threadMemory.compactedTurnCount() + " turns):"
-                + System.lineSeparator()
-                + threadMemory.summary();
     }
 
     private String describeActions(List<ToolActionRequest> actions) {

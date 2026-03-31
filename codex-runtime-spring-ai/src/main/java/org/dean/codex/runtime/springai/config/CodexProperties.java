@@ -8,6 +8,7 @@ public class CodexProperties {
     private String workspaceRoot = "";
     private String storageRoot = "";
     private final Agent agent = new Agent();
+    private final Model model = new Model();
     private final Shell shell = new Shell();
     private final Skills skills = new Skills();
     private final Context context = new Context();
@@ -30,6 +31,10 @@ public class CodexProperties {
 
     public Agent getAgent() {
         return agent;
+    }
+
+    public Model getModel() {
+        return model;
     }
 
     public Shell getShell() {
@@ -71,6 +76,27 @@ public class CodexProperties {
 
         public void setHistoryWindow(int historyWindow) {
             this.historyWindow = historyWindow;
+        }
+    }
+
+    public static class Model {
+        private int contextWindow = 0;
+        private int autoCompactTokenLimit = 0;
+
+        public int getContextWindow() {
+            return contextWindow;
+        }
+
+        public void setContextWindow(int contextWindow) {
+            this.contextWindow = contextWindow;
+        }
+
+        public int getAutoCompactTokenLimit() {
+            return autoCompactTokenLimit;
+        }
+
+        public void setAutoCompactTokenLimit(int autoCompactTokenLimit) {
+            this.autoCompactTokenLimit = autoCompactTokenLimit;
         }
     }
 

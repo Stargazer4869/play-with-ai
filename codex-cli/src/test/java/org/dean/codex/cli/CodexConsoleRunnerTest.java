@@ -11,8 +11,10 @@ import org.dean.codex.protocol.appserver.InitializeResponse;
 import org.dean.codex.protocol.appserver.InitializedNotification;
 import org.dean.codex.protocol.appserver.SkillsListParams;
 import org.dean.codex.protocol.appserver.SkillsListResponse;
+import org.dean.codex.protocol.appserver.ThreadCompaction;
 import org.dean.codex.protocol.appserver.ThreadCompactStartParams;
 import org.dean.codex.protocol.appserver.ThreadCompactStartResponse;
+import org.dean.codex.protocol.appserver.ThreadCompactionStartedNotification;
 import org.dean.codex.protocol.appserver.ThreadCompactedNotification;
 import org.dean.codex.protocol.appserver.ThreadListResponse;
 import org.dean.codex.protocol.appserver.ThreadReadParams;
@@ -176,7 +178,7 @@ class CodexConsoleRunnerTest {
     }
 
     @Test
-    void compactCommandPrintsThreadMemorySummary() throws Exception {
+    void compactCommandPrintsCompactionLifecycleAndCompatibilitySnapshot() throws Exception {
         CodexConsoleRunner runner = new CodexConsoleRunner(new StubAppServer(), new StubApprovalService());
 
         ByteArrayOutputStream output = new ByteArrayOutputStream();
@@ -190,8 +192,10 @@ class CodexConsoleRunnerTest {
         }
 
         String console = output.toString(StandardCharsets.UTF_8);
-        assertTrue(console.contains("Compacted thread memory"));
-        assertTrue(console.contains("Compacted earlier thread context"));
+        assertTrue(console.contains("[compaction] started"));
+        assertTrue(console.contains("[compaction] completed"));
+        assertTrue(console.contains("[compaction] response"));
+        assertTrue(console.contains("[memory] compatibility snapshot"));
     }
 
     private static final class StubAppServer implements CodexAppServer {
@@ -274,8 +278,35 @@ class CodexConsoleRunnerTest {
             public ThreadCompactStartResponse threadCompactStart(ThreadCompactStartParams params) {
                 ensureReady();
                 ThreadMemory threadMemory = latestThreadMemory(params.threadId());
-                publish(params.threadId(), new ThreadCompactedNotification(params.threadId(), threadMemory));
-                return new ThreadCompactStartResponse(threadMemory);
+                ThreadCompaction started = new ThreadCompaction(
+                        "comp-1",
+                        params.threadId(),
+                        List.of(),
+                        0,
+                        "",
+                        Instant.parse("2026-03-31T00:00:00Z"),
+                        null);
+                ThreadCompaction completed = new ThreadCompaction(
+                        "comp-1",
+                        params.threadId(),
+                        List.of(),
+                        threadMemory.compactedTurnCount(),
+                        threadMemory.summary(),
+                        Instant.parse("2026-03-31T00:00:00Z"),
+                        threadMemory.createdAt());
+                Thread notificationThread = new Thread(() -> {
+                    try {
+                        Thread.sleep(10);
+                    }
+                    catch (InterruptedException exception) {
+                        Thread.currentThread().interrupt();
+                    }
+                    publish(params.threadId(), new ThreadCompactionStartedNotification(started));
+                    publish(params.threadId(), new ThreadCompactedNotification(completed));
+                }, "stub-compaction-notifications");
+                notificationThread.setDaemon(true);
+                notificationThread.start();
+                return new ThreadCompactStartResponse(completed, threadMemory);
             }
 
             @Override
