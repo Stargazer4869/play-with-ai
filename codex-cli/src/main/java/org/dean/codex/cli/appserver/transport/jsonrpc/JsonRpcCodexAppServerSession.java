@@ -10,6 +10,7 @@ import org.dean.codex.protocol.appserver.InitializeResponse;
 import org.dean.codex.protocol.appserver.InitializedNotification;
 import org.dean.codex.protocol.appserver.SkillsListParams;
 import org.dean.codex.protocol.appserver.SkillsListResponse;
+import org.dean.codex.protocol.appserver.ThreadCompactionStartedNotification;
 import org.dean.codex.protocol.appserver.ThreadCompactStartParams;
 import org.dean.codex.protocol.appserver.ThreadCompactStartResponse;
 import org.dean.codex.protocol.appserver.ThreadCompactedNotification;
@@ -67,6 +68,7 @@ public class JsonRpcCodexAppServerSession implements CodexAppServerSession {
 
     private static final Map<String, Class<? extends AppServerNotification>> NOTIFICATION_TYPES = Map.of(
             "thread/started", ThreadStartedNotification.class,
+            "thread/compaction/started", ThreadCompactionStartedNotification.class,
             "thread/compacted", ThreadCompactedNotification.class,
             "turn/started", TurnStartedNotification.class,
             "turn/completed", TurnCompletedNotification.class,

@@ -9,8 +9,10 @@ import org.dean.codex.protocol.appserver.InitializeResponse;
 import org.dean.codex.protocol.appserver.InitializedNotification;
 import org.dean.codex.protocol.appserver.SkillsListParams;
 import org.dean.codex.protocol.appserver.SkillsListResponse;
+import org.dean.codex.protocol.appserver.ThreadCompaction;
 import org.dean.codex.protocol.appserver.ThreadCompactStartParams;
 import org.dean.codex.protocol.appserver.ThreadCompactStartResponse;
+import org.dean.codex.protocol.appserver.ThreadCompactionStartedNotification;
 import org.dean.codex.protocol.appserver.ThreadCompactedNotification;
 import org.dean.codex.protocol.appserver.ThreadListResponse;
 import org.dean.codex.protocol.appserver.ThreadReadParams;
@@ -39,9 +41,12 @@ import org.dean.codex.protocol.runtime.RuntimeNotificationType;
 import org.springframework.stereotype.Component;
 
 import java.nio.file.Path;
+import java.time.Instant;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.Consumer;
@@ -135,9 +140,29 @@ public class InProcessCodexAppServer implements CodexAppServer {
         public ThreadCompactStartResponse threadCompactStart(ThreadCompactStartParams params) {
             ensureReady();
             ThreadId threadId = requireThreadId(params);
+            String compactionId = UUID.randomUUID().toString();
+            Instant startedAt = Instant.now();
+            ThreadCompaction startedCompaction = new ThreadCompaction(
+                    compactionId,
+                    threadId,
+                    List.of(),
+                    0,
+                    "",
+                    startedAt,
+                    null);
+            publish(new ThreadCompactionStartedNotification(startedCompaction));
+
             var threadMemory = runtimeGateway.compactThread(threadId);
-            publish(new ThreadCompactedNotification(threadId, threadMemory));
-            return new ThreadCompactStartResponse(threadMemory);
+            ThreadCompaction completedCompaction = new ThreadCompaction(
+                    compactionId,
+                    threadId,
+                    threadMemory.sourceTurnIds(),
+                    threadMemory.compactedTurnCount(),
+                    threadMemory.summary(),
+                    startedAt,
+                    threadMemory.createdAt());
+            publish(new ThreadCompactedNotification(completedCompaction));
+            return new ThreadCompactStartResponse(completedCompaction, threadMemory);
         }
 
         @Override

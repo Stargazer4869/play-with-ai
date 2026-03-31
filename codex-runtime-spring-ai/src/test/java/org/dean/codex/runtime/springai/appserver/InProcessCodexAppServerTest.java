@@ -16,7 +16,9 @@ import org.dean.codex.protocol.appserver.AppServerNotification;
 import org.dean.codex.protocol.appserver.InitializeParams;
 import org.dean.codex.protocol.appserver.InitializedNotification;
 import org.dean.codex.protocol.appserver.SkillsListParams;
+import org.dean.codex.protocol.appserver.ThreadCompaction;
 import org.dean.codex.protocol.appserver.ThreadCompactStartParams;
+import org.dean.codex.protocol.appserver.ThreadCompactionStartedNotification;
 import org.dean.codex.protocol.appserver.ThreadCompactedNotification;
 import org.dean.codex.protocol.appserver.ThreadStartParams;
 import org.dean.codex.protocol.appserver.ThreadStartedNotification;
@@ -114,16 +116,26 @@ class InProcessCodexAppServerTest {
         try (CodexAppServerSession session = initializedSession(appServer);
              AutoCloseable ignored = session.subscribe(notifications::add)) {
             ThreadId threadId = session.threadStart(new ThreadStartParams("App thread")).thread().threadId();
-            ThreadMemory threadMemory = session.threadCompactStart(new ThreadCompactStartParams(threadId)).threadMemory();
+            var response = session.threadCompactStart(new ThreadCompactStartParams(threadId));
 
-            AppServerNotification notification = notifications.poll(2, TimeUnit.SECONDS);
-            while (notification instanceof ThreadStartedNotification) {
-                notification = notifications.poll(2, TimeUnit.SECONDS);
-            }
-            assertNotNull(notification);
-            assertTrue(notification instanceof ThreadCompactedNotification);
-            assertEquals(threadId, ((ThreadCompactedNotification) notification).threadId());
-            assertEquals(threadMemory.memoryId(), ((ThreadCompactedNotification) notification).threadMemory().memoryId());
+            List<AppServerNotification> observed = awaitNotifications(notifications, 3);
+            assertTrue(observed.stream().anyMatch(ThreadCompactionStartedNotification.class::isInstance));
+            assertTrue(observed.stream().anyMatch(ThreadCompactedNotification.class::isInstance));
+
+            ThreadCompactionStartedNotification started = (ThreadCompactionStartedNotification) observed.stream()
+                    .filter(ThreadCompactionStartedNotification.class::isInstance)
+                    .findFirst()
+                    .orElseThrow();
+            ThreadCompactedNotification completed = (ThreadCompactedNotification) observed.stream()
+                    .filter(ThreadCompactedNotification.class::isInstance)
+                    .findFirst()
+                    .orElseThrow();
+
+            assertEquals(threadId, started.compaction().threadId());
+            assertEquals(threadId, completed.compaction().threadId());
+            assertEquals(response.compaction().compactionId(), completed.compaction().compactionId());
+            assertNotNull(response.threadMemory());
+            assertTrue(response.compaction().completed());
         }
     }
 
@@ -159,9 +171,10 @@ class InProcessCodexAppServerTest {
             ThreadId threadId = session.threadStart(new ThreadStartParams("App thread")).thread().threadId();
             session.threadCompactStart(new ThreadCompactStartParams(threadId));
 
-            List<AppServerNotification> observed = awaitNotifications(notifications, 1);
-            assertEquals(1, observed.size());
-            assertTrue(observed.get(0) instanceof ThreadCompactedNotification);
+            List<AppServerNotification> observed = awaitNotifications(notifications, 2);
+            assertEquals(2, observed.size());
+            assertTrue(observed.stream().anyMatch(ThreadCompactionStartedNotification.class::isInstance));
+            assertTrue(observed.stream().anyMatch(ThreadCompactedNotification.class::isInstance));
             assertFalse(observed.stream().anyMatch(ThreadStartedNotification.class::isInstance));
         }
     }

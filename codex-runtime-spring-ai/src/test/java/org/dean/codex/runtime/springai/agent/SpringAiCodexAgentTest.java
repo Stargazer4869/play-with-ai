@@ -1,6 +1,7 @@
 package org.dean.codex.runtime.springai.agent;
 
 import org.dean.codex.core.approval.CommandApprovalService;
+import org.dean.codex.core.context.ContextManager;
 import org.dean.codex.core.context.ThreadContextReconstructionService;
 import org.dean.codex.core.conversation.InMemoryConversationStore;
 import org.dean.codex.core.skill.ResolvedSkill;
@@ -9,7 +10,10 @@ import org.dean.codex.core.tool.local.ShellCommandTool;
 import org.dean.codex.protocol.approval.ApprovalId;
 import org.dean.codex.protocol.approval.ApprovalStatus;
 import org.dean.codex.protocol.approval.CommandApprovalRequest;
+import org.dean.codex.protocol.context.ReconstructedTurnActivity;
 import org.dean.codex.protocol.context.ReconstructedThreadContext;
+import org.dean.codex.protocol.conversation.ConversationMessage;
+import org.dean.codex.protocol.conversation.MessageRole;
 import org.dean.codex.protocol.context.ThreadMemory;
 import org.dean.codex.protocol.conversation.ThreadId;
 import org.dean.codex.protocol.conversation.TurnId;
@@ -21,6 +25,7 @@ import org.dean.codex.protocol.tool.FileSearchResult;
 import org.dean.codex.protocol.tool.FileWriteResult;
 import org.dean.codex.protocol.tool.SearchMatch;
 import org.dean.codex.protocol.tool.ShellCommandResult;
+import org.dean.codex.runtime.springai.config.CodexProperties;
 import org.dean.codex.protocol.skill.SkillMetadata;
 import org.dean.codex.protocol.skill.SkillScope;
 import org.junit.jupiter.api.BeforeEach;
@@ -35,8 +40,13 @@ import org.springframework.core.io.Resource;
 import java.nio.charset.Charset;
 import java.nio.file.Path;
 import java.time.Instant;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Deque;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -59,8 +69,10 @@ class SpringAiCodexAgentTest {
                 new StubShellCommandTool(),
                 new NoOpCommandApprovalService(),
                 new NoOpThreadContextReconstructionService(),
+                new NoOpContextManager(),
                 new NoOpSkillService(),
                 Path.of("/tmp/workspace"),
+                defaultModelProperties(),
                 6,
                 2
         );
@@ -238,12 +250,14 @@ class SpringAiCodexAgentTest {
                                 List.of(),
                                 0,
                                 Instant.now()),
+                        List.of(new ConversationMessage(new TurnId("turn-1"), MessageRole.USER, "Replay canonical history", Instant.now())),
                         List.of(),
-                        List.of(),
-                        List.of(),
+                        List.of(new ReconstructedTurnActivity(new TurnId("turn-1"), "historyToolCall", "toolCall: READ_FILE README.md", Instant.now())),
                         Instant.now())),
+                new NoOpContextManager(),
                 new StaticSkillService(new ResolvedSkill(metadata, "# reviewer\n\nReview carefully.")),
                 Path.of("/tmp/workspace"),
+                defaultModelProperties(),
                 6,
                 2
         );
@@ -253,9 +267,9 @@ class SpringAiCodexAgentTest {
                 new ReconstructedThreadContext(
                         threadId,
                         new ThreadMemory("memory-1", threadId, "Compacted earlier thread context.", List.of(), 0, Instant.now()),
+                        List.of(new ConversationMessage(new TurnId("turn-1"), MessageRole.USER, "Replay canonical history", Instant.now())),
                         List.of(),
-                        List.of(),
-                        List.of(),
+                        List.of(new ReconstructedTurnActivity(new TurnId("turn-1"), "historyToolCall", "toolCall: READ_FILE README.md", Instant.now())),
                         Instant.now()),
                 "Please use $reviewer",
                 "",
@@ -265,7 +279,165 @@ class SpringAiCodexAgentTest {
 
         assertTrue(prompt.contains("Skill: reviewer"));
         assertTrue(prompt.contains("Review carefully."));
-        assertTrue(prompt.contains("Compacted earlier thread context."));
+        assertTrue(prompt.contains("USER: Replay canonical history"));
+        assertTrue(prompt.contains("toolCall: READ_FILE README.md"));
+        assertFalse(prompt.contains("Compacted thread memory"));
+        assertFalse(prompt.contains("Compacted earlier thread context."));
+    }
+
+    @Test
+    void autoCompactionDoesNotTriggerWhenPromptEstimateIsBelowLimit() {
+        RecordingContextManager contextManager = new RecordingContextManager();
+        SpringAiCodexAgent agent = new ScriptedSpringAiCodexAgent(
+                new NoOpChatClientBuilder(),
+                path -> new FileReadResult(true, path, "", false, 0, ""),
+                (query, scope) -> new FileSearchResult(true, query, scope, List.of(), 0, false, ""),
+                (path, oldText, newText, replaceAll) -> new FilePatchResult(true, path, 1, 0, ""),
+                (path, content) -> new FileWriteResult(true, path, true, content == null ? 0 : content.length(), ""),
+                new StubShellCommandTool(),
+                new NoOpCommandApprovalService(),
+                new FixedThreadContextReconstructionService(smallPromptContext()),
+                contextManager,
+                new NoOpSkillService(),
+                Path.of("/tmp/workspace"),
+                codexProperties(1000, 0),
+                6,
+                2,
+                List.of("""
+                        {
+                          "summary": "All done",
+                          "finalAnswer": "Finished"
+                        }
+                        """),
+                List.of(0));
+
+        var result = agent.handleTurn(new ThreadId("thread-1"), new TurnId("turn-1"), "small prompt");
+
+        assertEquals(0, contextManager.compactionCount.get());
+        assertEquals(TurnStatus.COMPLETED, result.status());
+    }
+
+    @Test
+    void autoCompactionTriggersBeforeSamplingWhenPromptEstimateIsOverLimit() {
+        RecordingContextManager contextManager = new RecordingContextManager();
+        SpringAiCodexAgent agent = new ScriptedSpringAiCodexAgent(
+                new NoOpChatClientBuilder(),
+                path -> new FileReadResult(true, path, "", false, 0, ""),
+                (query, scope) -> new FileSearchResult(true, query, scope, List.of(), 0, false, ""),
+                (path, oldText, newText, replaceAll) -> new FilePatchResult(true, path, 1, 0, ""),
+                (path, content) -> new FileWriteResult(true, path, true, content == null ? 0 : content.length(), ""),
+                new StubShellCommandTool(),
+                new NoOpCommandApprovalService(),
+                new FixedThreadContextReconstructionService(largePromptContext()),
+                contextManager,
+                new NoOpSkillService(),
+                Path.of("/tmp/workspace"),
+                codexProperties(1000, 0),
+                6,
+                2,
+                List.of("""
+                        {
+                          "summary": "Done",
+                          "finalAnswer": "Finished"
+                        }
+                        """),
+                List.of(1));
+
+        var result = agent.handleTurn(new ThreadId("thread-1"), new TurnId("turn-1"), "large prompt");
+
+        assertEquals(1, contextManager.compactionCount.get());
+        assertEquals(TurnStatus.COMPLETED, result.status());
+    }
+
+    @Test
+    void autoCompactionTriggersAfterActionsWhenNextPromptWouldExceedLimit() {
+        RecordingContextManager contextManager = new RecordingContextManager();
+        PlanningState planningState = new PlanningState();
+        SpringAiCodexAgent agent = new ScriptedSpringAiCodexAgent(
+                new NoOpChatClientBuilder(),
+                path -> new FileReadResult(true, path, "", false, 0, ""),
+                (query, scope) -> new FileSearchResult(true, query, scope, List.of(), 0, false, ""),
+                (path, oldText, newText, replaceAll) -> new FilePatchResult(true, path, 1, 0, ""),
+                (path, content) -> new FileWriteResult(true, path, true, content == null ? 0 : content.length(), ""),
+                new StubShellCommandTool(planningState),
+                new NoOpCommandApprovalService(),
+                new MutableThreadContextReconstructionService(planningState, contextManager),
+                contextManager,
+                new NoOpSkillService(),
+                Path.of("/tmp/workspace"),
+                codexProperties(1000, 0),
+                6,
+                2,
+                List.of("""
+                        {
+                          "summary": "Run the command",
+                          "actions": [
+                            {"action": "RUN_COMMAND", "command": "echo big-output"}
+                          ]
+                        }
+                        """,
+                        """
+                        {
+                          "summary": "Done",
+                          "finalAnswer": "Finished"
+                        }
+                        """),
+                List.of(0, 1));
+
+        var result = agent.handleTurn(new ThreadId("thread-1"), new TurnId("turn-1"), "run command");
+
+        assertEquals(1, contextManager.compactionCount.get());
+        assertEquals(TurnStatus.COMPLETED, result.status());
+    }
+
+    @Test
+    void autoCompactionCanTriggerBeforeSamplingAndAfterActionsInTheSameTurn() {
+        RecordingContextManager contextManager = new RecordingContextManager();
+        PlanningState planningState = new PlanningState();
+        ThreadContextReconstructionService reconstructionService = threadId -> {
+            if (planningState.commandExecuted.get() && contextManager.compactionCount.get() == 1) {
+                return largePromptContext();
+            }
+            if (contextManager.compactionCount.get() >= 2) {
+                return smallPromptContext();
+            }
+            return largePromptContext();
+        };
+        SpringAiCodexAgent agent = new ScriptedSpringAiCodexAgent(
+                new NoOpChatClientBuilder(),
+                path -> new FileReadResult(true, path, "", false, 0, ""),
+                (query, scope) -> new FileSearchResult(true, query, scope, List.of(), 0, false, ""),
+                (path, oldText, newText, replaceAll) -> new FilePatchResult(true, path, 1, 0, ""),
+                (path, content) -> new FileWriteResult(true, path, true, content == null ? 0 : content.length(), ""),
+                new StubShellCommandTool(planningState),
+                new NoOpCommandApprovalService(),
+                reconstructionService,
+                contextManager,
+                new NoOpSkillService(),
+                Path.of("/tmp/workspace"),
+                codexProperties(1000, 0),
+                6,
+                2,
+                List.of("""
+                        {
+                          "summary": "Run the command",
+                          "actions": [
+                            {"action": "RUN_COMMAND", "command": "echo large-output"}
+                          ]
+                        }
+                        """,
+                        """
+                        {
+                          "summary": "Done",
+                          "finalAnswer": "Finished"
+                        }
+                        """),
+                List.of(1, 2));
+
+        var result = agent.handleTurn(new ThreadId("thread-1"), new TurnId("turn-1"), "run command");
+
+        assertEquals(2, contextManager.compactionCount.get());
+        assertEquals(TurnStatus.COMPLETED, result.status());
     }
 
     private static final class NoOpChatClientBuilder implements ChatClient.Builder {
@@ -435,16 +607,32 @@ class SpringAiCodexAgentTest {
 
     private static final class StubShellCommandTool implements ShellCommandTool {
 
+        private final PlanningState planningState;
+
+        private StubShellCommandTool() {
+            this(new PlanningState());
+        }
+
+        private StubShellCommandTool(PlanningState planningState) {
+            this.planningState = planningState;
+        }
+
         @Override
         public ShellCommandResult runCommand(String command) {
+            planningState.commandExecuted.set(true);
             return new ShellCommandResult(true, command, 0, "", "", false, "/tmp/workspace", true,
-                    CommandApprovalDecision.ALLOW, "Allowed", "");
+                    CommandApprovalDecision.ALLOW, "Allowed", bigOutput());
         }
 
         @Override
         public ShellCommandResult runApprovedCommand(String command) {
+            planningState.commandExecuted.set(true);
             return new ShellCommandResult(true, command, 0, "", "", false, "/tmp/workspace", true,
-                    CommandApprovalDecision.ALLOW, "Explicitly approved", "");
+                    CommandApprovalDecision.ALLOW, "Explicitly approved", bigOutput());
+        }
+
+        private String bigOutput() {
+            return "x".repeat(5000);
         }
     }
 
@@ -469,6 +657,37 @@ class SpringAiCodexAgentTest {
         }
     }
 
+    private static final class NoOpContextManager implements ContextManager {
+
+        @Override
+        public java.util.Optional<ThreadMemory> latestThreadMemory(ThreadId threadId) {
+            return java.util.Optional.empty();
+        }
+
+        @Override
+        public ThreadMemory compactThread(ThreadId threadId) {
+            return new ThreadMemory("memory-0", threadId, "summary", List.of(), 0, Instant.now());
+        }
+    }
+
+    private static final class MutableThreadContextReconstructionService implements ThreadContextReconstructionService {
+
+        private final PlanningState planningState;
+        private final RecordingContextManager contextManager;
+
+        private MutableThreadContextReconstructionService(PlanningState planningState, RecordingContextManager contextManager) {
+            this.planningState = planningState;
+            this.contextManager = contextManager;
+        }
+
+        @Override
+        public ReconstructedThreadContext reconstruct(ThreadId threadId) {
+            return planningState.commandExecuted.get() && contextManager.compactionCount.get() == 0
+                    ? largePromptContext()
+                    : smallPromptContext();
+        }
+    }
+
     private static final class FixedThreadContextReconstructionService implements ThreadContextReconstructionService {
 
         private final ReconstructedThreadContext reconstructedThreadContext;
@@ -481,6 +700,122 @@ class SpringAiCodexAgentTest {
         public ReconstructedThreadContext reconstruct(ThreadId threadId) {
             return reconstructedThreadContext;
         }
+    }
+
+    private static final class ScriptedSpringAiCodexAgent extends SpringAiCodexAgent {
+
+        private final Deque<String> responses;
+        private final List<Integer> expectedCompactionsAtDecision;
+        private final RecordingContextManager contextManager;
+        private final AtomicInteger decisionCount = new AtomicInteger();
+
+        private ScriptedSpringAiCodexAgent(ChatClient.Builder chatClientBuilder,
+                                           org.dean.codex.core.tool.local.FileReaderTool fileReaderTool,
+                                           org.dean.codex.core.tool.local.FileSearchTool fileSearchTool,
+                                           org.dean.codex.core.tool.local.FilePatchTool filePatchTool,
+                                           org.dean.codex.core.tool.local.FileWriterTool fileWriterTool,
+                                           ShellCommandTool shellCommandTool,
+                                           CommandApprovalService commandApprovalService,
+                                           ThreadContextReconstructionService threadContextReconstructionService,
+                                           RecordingContextManager contextManager,
+                                           SkillService skillService,
+                                           Path workspaceRoot,
+                                           CodexProperties codexProperties,
+                                           int maxSteps,
+                                           int maxActionsPerTurn,
+                                           List<String> responses,
+                                           List<Integer> expectedCompactionsAtDecision) {
+            super(chatClientBuilder,
+                    fileReaderTool,
+                    fileSearchTool,
+                    filePatchTool,
+                    fileWriterTool,
+                    shellCommandTool,
+                    commandApprovalService,
+                    threadContextReconstructionService,
+                    contextManager,
+                    skillService,
+                    workspaceRoot,
+                    codexProperties,
+                    maxSteps,
+                    maxActionsPerTurn);
+            this.responses = new ArrayDeque<>(responses);
+            this.expectedCompactionsAtDecision = List.copyOf(expectedCompactionsAtDecision);
+            this.contextManager = contextManager;
+        }
+
+        @Override
+        protected PlannerStep requestDecision(ThreadId threadId,
+                                              String input,
+                                              String scratchpad,
+                                              int step,
+                                              List<ResolvedSkill> selectedSkills,
+                                              List<SkillMetadata> availableSkills,
+                                              List<String> steeringInputs) {
+            int index = decisionCount.getAndIncrement();
+            int expected = expectedCompactionsAtDecision.get(Math.min(index, expectedCompactionsAtDecision.size() - 1));
+            assertEquals(expected, contextManager.compactionCount.get());
+            String response = responses.isEmpty() ? """
+                    {
+                      "summary": "Done",
+                      "finalAnswer": "Finished"
+                    }
+                    """ : responses.removeFirst();
+            return parseDecision(response);
+        }
+    }
+
+    private static final class RecordingContextManager implements ContextManager {
+
+        private final AtomicInteger compactionCount = new AtomicInteger();
+
+        @Override
+        public java.util.Optional<ThreadMemory> latestThreadMemory(ThreadId threadId) {
+            return java.util.Optional.of(new ThreadMemory("memory-1", threadId, "summary", List.of(), 0, Instant.now()));
+        }
+
+        @Override
+        public ThreadMemory compactThread(ThreadId threadId) {
+            compactionCount.incrementAndGet();
+            return new ThreadMemory("memory-1", threadId, "summary", List.of(), 0, Instant.now());
+        }
+    }
+
+    private static final class PlanningState {
+
+        private final AtomicBoolean commandExecuted = new AtomicBoolean();
+    }
+
+    private static CodexProperties defaultModelProperties() {
+        return codexProperties(0, 0);
+    }
+
+    private static CodexProperties codexProperties(int autoCompactTokenLimit, int contextWindow) {
+        CodexProperties properties = new CodexProperties();
+        properties.getModel().setAutoCompactTokenLimit(autoCompactTokenLimit);
+        properties.getModel().setContextWindow(contextWindow);
+        return properties;
+    }
+
+    private static ReconstructedThreadContext smallPromptContext() {
+        return new ReconstructedThreadContext(
+                new ThreadId("thread-1"),
+                new ThreadMemory("memory-1", new ThreadId("thread-1"), "summary", List.of(), 0, Instant.now()),
+                List.of(new ConversationMessage(new TurnId("turn-1"), MessageRole.USER, "small prompt", Instant.now())),
+                List.of(),
+                List.of(),
+                Instant.now());
+    }
+
+    private static ReconstructedThreadContext largePromptContext() {
+        String largeText = "large prompt ".repeat(600);
+        return new ReconstructedThreadContext(
+                new ThreadId("thread-1"),
+                new ThreadMemory("memory-1", new ThreadId("thread-1"), "summary", List.of(), 0, Instant.now()),
+                List.of(new ConversationMessage(new TurnId("turn-1"), MessageRole.USER, largeText, Instant.now())),
+                List.of(),
+                List.of(),
+                Instant.now());
     }
 
     private static final class StaticSkillService implements SkillService {

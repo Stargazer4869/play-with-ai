@@ -3,6 +3,7 @@ package org.dean.codex.runtime.springai.approval;
 import org.dean.codex.core.approval.CommandApprovalService;
 import org.dean.codex.core.approval.CommandApprovalStore;
 import org.dean.codex.core.conversation.ConversationStore;
+import org.dean.codex.core.history.ThreadHistoryStore;
 import org.dean.codex.core.tool.local.ShellCommandTool;
 import org.dean.codex.protocol.approval.ApprovalId;
 import org.dean.codex.protocol.approval.ApprovalStatus;
@@ -12,21 +13,27 @@ import org.dean.codex.protocol.conversation.ThreadId;
 import org.dean.codex.protocol.conversation.TurnId;
 import org.dean.codex.protocol.item.ApprovalItem;
 import org.dean.codex.protocol.item.ApprovalState;
+import org.dean.codex.protocol.item.TurnItem;
+import org.dean.codex.runtime.springai.history.ThreadHistoryMapper;
 import org.dean.codex.protocol.tool.ShellCommandResult;
 
 import java.time.Instant;
 import java.util.List;
+
 public class DefaultCommandApprovalService implements CommandApprovalService {
 
     private final CommandApprovalStore commandApprovalStore;
     private final ConversationStore conversationStore;
+    private final ThreadHistoryStore threadHistoryStore;
     private final ShellCommandTool shellCommandTool;
 
     public DefaultCommandApprovalService(CommandApprovalStore commandApprovalStore,
                                          ConversationStore conversationStore,
+                                         ThreadHistoryStore threadHistoryStore,
                                          ShellCommandTool shellCommandTool) {
         this.commandApprovalStore = commandApprovalStore;
         this.conversationStore = conversationStore;
+        this.threadHistoryStore = threadHistoryStore;
         this.shellCommandTool = shellCommandTool;
     }
 
@@ -67,11 +74,13 @@ public class DefaultCommandApprovalService implements CommandApprovalService {
                 "Approved from CLI.",
                 result);
         commandApprovalStore.save(approvedRequest);
-        conversationStore.appendTurnItems(threadId, request.turnId(), List.of(
+        List<TurnItem> approvalItems = List.of(
                 approvalItem(ApprovalState.APPROVED, request.approvalId(), request.command(),
                         "Approved command " + shortApprovalId(request.approvalId()) + ": " + request.command(), now),
                 approvalItem(ApprovalState.RESULT, request.approvalId(), request.command(), summarizeApprovedResult(result), now)
-        ));
+        );
+        conversationStore.appendTurnItems(threadId, request.turnId(), approvalItems);
+        threadHistoryStore.append(threadId, ThreadHistoryMapper.map(request.turnId(), approvalItems));
         return approvedRequest;
     }
 
@@ -93,10 +102,12 @@ public class DefaultCommandApprovalService implements CommandApprovalService {
                 note,
                 null);
         commandApprovalStore.save(rejectedRequest);
-        conversationStore.appendTurnItems(threadId, request.turnId(), List.of(
+        List<TurnItem> approvalItems = List.of(
                 approvalItem(ApprovalState.REJECTED, request.approvalId(), request.command(),
                         "Rejected command " + shortApprovalId(request.approvalId()) + ": " + note, now)
-        ));
+        );
+        conversationStore.appendTurnItems(threadId, request.turnId(), approvalItems);
+        threadHistoryStore.append(threadId, ThreadHistoryMapper.map(request.turnId(), approvalItems));
         return rejectedRequest;
     }
 
