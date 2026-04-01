@@ -1,6 +1,7 @@
 package org.dean.codex.runtime.springai.agent;
 
 import org.dean.codex.core.approval.CommandApprovalService;
+import org.dean.codex.core.agent.AgentControl;
 import org.dean.codex.core.context.ContextManager;
 import org.dean.codex.core.context.ThreadContextReconstructionService;
 import org.dean.codex.core.conversation.InMemoryConversationStore;
@@ -10,6 +11,11 @@ import org.dean.codex.core.tool.local.ShellCommandTool;
 import org.dean.codex.protocol.approval.ApprovalId;
 import org.dean.codex.protocol.approval.ApprovalStatus;
 import org.dean.codex.protocol.approval.CommandApprovalRequest;
+import org.dean.codex.protocol.agent.AgentMessage;
+import org.dean.codex.protocol.agent.AgentSpawnRequest;
+import org.dean.codex.protocol.agent.AgentStatus;
+import org.dean.codex.protocol.agent.AgentSummary;
+import org.dean.codex.protocol.agent.AgentWaitResult;
 import org.dean.codex.protocol.context.ReconstructedTurnActivity;
 import org.dean.codex.protocol.context.ReconstructedThreadContext;
 import org.dean.codex.protocol.conversation.ConversationMessage;
@@ -25,6 +31,8 @@ import org.dean.codex.protocol.tool.FileSearchResult;
 import org.dean.codex.protocol.tool.FileWriteResult;
 import org.dean.codex.protocol.tool.SearchMatch;
 import org.dean.codex.protocol.tool.ShellCommandResult;
+import org.dean.codex.protocol.item.ToolCallItem;
+import org.dean.codex.protocol.item.ToolResultItem;
 import org.dean.codex.runtime.springai.config.CodexProperties;
 import org.dean.codex.protocol.skill.SkillMetadata;
 import org.dean.codex.protocol.skill.SkillScope;
@@ -51,6 +59,7 @@ import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -68,13 +77,12 @@ class SpringAiCodexAgentTest {
                 (path, content) -> new FileWriteResult(true, path, true, content == null ? 0 : content.length(), ""),
                 new StubShellCommandTool(),
                 new NoOpCommandApprovalService(),
+                new NoOpAgentControl(),
                 new NoOpThreadContextReconstructionService(),
                 new NoOpContextManager(),
                 new NoOpSkillService(),
                 Path.of("/tmp/workspace"),
-                defaultModelProperties(),
-                6,
-                2
+                defaultModelProperties()
         );
     }
 
@@ -124,7 +132,7 @@ class SpringAiCodexAgentTest {
 
         assertFalse(step.isFinished());
         assertEquals(3, step.actions().size());
-        assertTrue(step.validationError().contains("configured limit of 2"));
+        assertTrue(step.validationError().contains("configured per-step limit of 2"));
     }
 
     @Test
@@ -204,6 +212,79 @@ class SpringAiCodexAgentTest {
     }
 
     @Test
+    void parseDecisionSupportsSubAgentActions() {
+        SpringAiCodexAgent parsingAgent = new SpringAiCodexAgent(
+                new NoOpChatClientBuilder(),
+                path -> new FileReadResult(true, path, "", false, 0, ""),
+                (query, scope) -> new FileSearchResult(true, query, scope, List.of(), 0, false, ""),
+                (path, oldText, newText, replaceAll) -> new FilePatchResult(true, path, 1, 0, ""),
+                (path, content) -> new FileWriteResult(true, path, true, content == null ? 0 : content.length(), ""),
+                new StubShellCommandTool(),
+                new NoOpCommandApprovalService(),
+                new NoOpAgentControl(),
+                new NoOpThreadContextReconstructionService(),
+                new NoOpContextManager(),
+                new NoOpSkillService(),
+                Path.of("/tmp/workspace"),
+                codexProperties(6, 8, 0, 0));
+
+        SpringAiCodexAgent.PlannerStep step = parsingAgent.parseDecision("""
+                {
+                  "summary": "Delegate work to sub-agents",
+                  "actions": [
+                    {
+                      "action": "spawn_agent",
+                      "taskName": "inspect repository",
+                      "prompt": "inspect repository",
+                      "nickname": "inspector",
+                      "role": "reviewer",
+                      "depth": 1,
+                      "modelProvider": "openai",
+                      "model": "gpt-5",
+                      "cwd": "subdir"
+                    },
+                    {
+                      "action": "send_input",
+                      "threadId": "agent-1",
+                      "content": "continue",
+                      "interrupt": true
+                    },
+                    {
+                      "action": "wait_agent",
+                      "threadIds": ["agent-1", "agent-2"],
+                      "timeoutMillis": 2500
+                    },
+                    {
+                      "action": "resume_agent",
+                      "threadId": "agent-1"
+                    },
+                    {
+                      "action": "close_agent",
+                      "threadId": "agent-1"
+                    },
+                    {
+                      "action": "list_agents",
+                      "threadId": "thread-parent",
+                      "recursive": false
+                    }
+                  ]
+                }
+                """);
+
+        assertFalse(step.isFinished());
+        assertNull(step.validationError());
+        assertEquals(6, step.actions().size());
+        assertEquals(SpringAiCodexAgent.ToolAction.SPAWN_AGENT, step.actions().get(0).action());
+        assertEquals("inspect repository", step.actions().get(0).taskName());
+        assertEquals(SpringAiCodexAgent.ToolAction.SEND_INPUT, step.actions().get(1).action());
+        assertEquals("agent-1", step.actions().get(1).threadId());
+        assertEquals(List.of(new ThreadId("agent-1"), new ThreadId("agent-2")), step.actions().get(2).threadIds());
+        assertEquals(Long.valueOf(2500), step.actions().get(2).timeoutMillis());
+        assertEquals(SpringAiCodexAgent.ToolAction.LIST_AGENTS, step.actions().get(5).action());
+        assertFalse(step.actions().get(5).recursive());
+    }
+
+    @Test
     void handleTurnReturnsStructuredResult() {
         ThreadId threadId = new ThreadId("thread-1");
         TurnId turnId = new TurnId("turn-1");
@@ -241,6 +322,7 @@ class SpringAiCodexAgentTest {
                 (path, content) -> new FileWriteResult(true, path, true, content == null ? 0 : content.length(), ""),
                 new StubShellCommandTool(),
                 new NoOpCommandApprovalService(),
+                new NoOpAgentControl(),
                 new FixedThreadContextReconstructionService(new ReconstructedThreadContext(
                         threadId,
                         new ThreadMemory(
@@ -257,9 +339,7 @@ class SpringAiCodexAgentTest {
                 new NoOpContextManager(),
                 new StaticSkillService(new ResolvedSkill(metadata, "# reviewer\n\nReview carefully.")),
                 Path.of("/tmp/workspace"),
-                defaultModelProperties(),
-                6,
-                2
+                defaultModelProperties()
         );
 
         var selectedSkills = agent.selectedSkillsForInput("Please use $reviewer");
@@ -296,13 +376,12 @@ class SpringAiCodexAgentTest {
                 (path, content) -> new FileWriteResult(true, path, true, content == null ? 0 : content.length(), ""),
                 new StubShellCommandTool(),
                 new NoOpCommandApprovalService(),
+                new NoOpAgentControl(),
                 new FixedThreadContextReconstructionService(smallPromptContext()),
                 contextManager,
                 new NoOpSkillService(),
                 Path.of("/tmp/workspace"),
-                codexProperties(1000, 0),
-                6,
-                2,
+                codexProperties(6, 2, 2200, 0),
                 List.of("""
                         {
                           "summary": "All done",
@@ -328,13 +407,12 @@ class SpringAiCodexAgentTest {
                 (path, content) -> new FileWriteResult(true, path, true, content == null ? 0 : content.length(), ""),
                 new StubShellCommandTool(),
                 new NoOpCommandApprovalService(),
+                new NoOpAgentControl(),
                 new FixedThreadContextReconstructionService(largePromptContext()),
                 contextManager,
                 new NoOpSkillService(),
                 Path.of("/tmp/workspace"),
-                codexProperties(1000, 0),
-                6,
-                2,
+                codexProperties(6, 2, 2200, 0),
                 List.of("""
                         {
                           "summary": "Done",
@@ -361,13 +439,12 @@ class SpringAiCodexAgentTest {
                 (path, content) -> new FileWriteResult(true, path, true, content == null ? 0 : content.length(), ""),
                 new StubShellCommandTool(planningState),
                 new NoOpCommandApprovalService(),
+                new NoOpAgentControl(),
                 new MutableThreadContextReconstructionService(planningState, contextManager),
                 contextManager,
                 new NoOpSkillService(),
                 Path.of("/tmp/workspace"),
-                codexProperties(1000, 0),
-                6,
-                2,
+                codexProperties(6, 2, 2200, 0),
                 List.of("""
                         {
                           "summary": "Run the command",
@@ -411,13 +488,12 @@ class SpringAiCodexAgentTest {
                 (path, content) -> new FileWriteResult(true, path, true, content == null ? 0 : content.length(), ""),
                 new StubShellCommandTool(planningState),
                 new NoOpCommandApprovalService(),
+                new NoOpAgentControl(),
                 reconstructionService,
                 contextManager,
                 new NoOpSkillService(),
                 Path.of("/tmp/workspace"),
-                codexProperties(1000, 0),
-                6,
-                2,
+                codexProperties(6, 2, 1000, 0),
                 List.of("""
                         {
                           "summary": "Run the command",
@@ -438,6 +514,120 @@ class SpringAiCodexAgentTest {
 
         assertEquals(2, contextManager.compactionCount.get());
         assertEquals(TurnStatus.COMPLETED, result.status());
+    }
+
+    @Test
+    void handleTurnRoutesSubAgentActionsThroughAgentControl() {
+        RecordingAgentControl agentControl = new RecordingAgentControl();
+        SpringAiCodexAgent agent = new ScriptedSpringAiCodexAgent(
+                new NoOpChatClientBuilder(),
+                path -> new FileReadResult(true, path, "", false, 0, ""),
+                (query, scope) -> new FileSearchResult(true, query, scope, List.of(), 0, false, ""),
+                (path, oldText, newText, replaceAll) -> new FilePatchResult(true, path, 1, 0, ""),
+                (path, content) -> new FileWriteResult(true, path, true, content == null ? 0 : content.length(), ""),
+                new StubShellCommandTool(),
+                new NoOpCommandApprovalService(),
+                agentControl,
+                new NoOpThreadContextReconstructionService(),
+                new RecordingContextManager(),
+                new NoOpSkillService(),
+                Path.of("/tmp/workspace"),
+                codexProperties(8, 2, 0, 0),
+                List.of("""
+                        {
+                          "summary": "Spawn a helper",
+                          "actions": [
+                            {
+                              "action": "spawn_agent",
+                              "taskName": "inspect repository",
+                              "prompt": "inspect repository",
+                              "nickname": "inspector",
+                              "role": "reviewer",
+                              "depth": 1
+                            }
+                          ]
+                        }
+                        """,
+                        """
+                        {
+                          "summary": "Message the helper",
+                          "actions": [
+                            {
+                              "action": "send_input",
+                              "threadId": "agent-1",
+                              "content": "continue",
+                              "interrupt": true
+                            }
+                          ]
+                        }
+                        """,
+                        """
+                        {
+                          "summary": "Wait for the helper",
+                          "actions": [
+                            {
+                              "action": "wait_agent",
+                              "threadIds": ["agent-1"],
+                              "timeoutMillis": 1000
+                            }
+                          ]
+                        }
+                        """,
+                        """
+                        {
+                          "summary": "Resume the helper",
+                          "actions": [
+                            {
+                              "action": "resume_agent",
+                              "threadId": "agent-1"
+                            }
+                          ]
+                        }
+                        """,
+                        """
+                        {
+                          "summary": "Close the helper",
+                          "actions": [
+                            {
+                              "action": "close_agent",
+                              "threadId": "agent-1"
+                            }
+                          ]
+                        }
+                        """,
+                        """
+                        {
+                          "summary": "List helper agents",
+                          "actions": [
+                            {
+                              "action": "list_agents",
+                              "recursive": true
+                            }
+                          ]
+                        }
+                        """,
+                        """
+                        {
+                          "summary": "Done",
+                          "finalAnswer": "Finished"
+                        }
+                        """),
+                List.of(0, 0, 0, 0, 0, 0, 0));
+
+        ThreadId threadId = new ThreadId("thread-parent");
+        var result = agent.handleTurn(threadId, new TurnId("turn-1"), "delegate subagents");
+
+        assertEquals(TurnStatus.COMPLETED, result.status());
+        assertEquals("inspect repository", agentControl.spawnRequest.taskName());
+        assertEquals(threadId, agentControl.spawnRequest.parentThreadId());
+        assertEquals(new ThreadId("agent-1"), agentControl.sendInputThreadId);
+        assertEquals("continue", agentControl.sendInputMessage.content());
+        assertEquals(List.of(new ThreadId("agent-1")), agentControl.waitThreadIds);
+        assertEquals(new ThreadId("agent-1"), agentControl.resumeThreadId);
+        assertEquals(new ThreadId("agent-1"), agentControl.closeThreadId);
+        assertEquals(threadId, agentControl.listAgentsParentThreadId);
+        assertTrue(result.items().stream().anyMatch(ToolCallItem.class::isInstance));
+        assertTrue(result.items().stream().anyMatch(ToolResultItem.class::isInstance));
     }
 
     private static final class NoOpChatClientBuilder implements ChatClient.Builder {
@@ -649,6 +839,103 @@ class SpringAiCodexAgentTest {
         }
     }
 
+    private static final class NoOpAgentControl implements AgentControl {
+
+        @Override
+        public AgentSummary spawnAgent(AgentSpawnRequest request) {
+            return summary(request == null ? null : request.parentThreadId(), new ThreadId("agent-noop"), AgentStatus.IDLE);
+        }
+
+        @Override
+        public AgentSummary sendInput(ThreadId agentThreadId, AgentMessage message, boolean interrupt) {
+            return summary(null, agentThreadId, AgentStatus.RUNNING);
+        }
+
+        @Override
+        public AgentWaitResult waitAgent(List<ThreadId> agentThreadIds, long timeoutMillis) {
+            ThreadId threadId = agentThreadIds == null || agentThreadIds.isEmpty() ? null : agentThreadIds.get(0);
+            return new AgentWaitResult(threadId, null, AgentStatus.RUNNING, AgentStatus.IDLE, true, "Timed out.", "", Instant.now());
+        }
+
+        @Override
+        public AgentSummary resumeAgent(ThreadId agentThreadId) {
+            return summary(null, agentThreadId, AgentStatus.IDLE);
+        }
+
+        @Override
+        public AgentSummary closeAgent(ThreadId agentThreadId) {
+            return summary(null, agentThreadId, AgentStatus.SHUTDOWN);
+        }
+
+        @Override
+        public List<AgentSummary> listAgents(ThreadId parentThreadId, boolean recursive) {
+            return List.of();
+        }
+
+        private AgentSummary summary(ThreadId parentThreadId, ThreadId threadId, AgentStatus status) {
+            Instant now = Instant.now();
+            return new AgentSummary(threadId, parentThreadId, "noop", "noop", "noop", 1, status, now, now, status == AgentStatus.SHUTDOWN ? now : null);
+        }
+    }
+
+    private static final class RecordingAgentControl implements AgentControl {
+
+        private AgentSpawnRequest spawnRequest;
+        private AgentMessage sendInputMessage;
+        private ThreadId sendInputThreadId;
+        private List<ThreadId> waitThreadIds = List.of();
+        private long waitTimeoutMillis;
+        private ThreadId resumeThreadId;
+        private ThreadId closeThreadId;
+        private ThreadId listAgentsParentThreadId;
+        private boolean listAgentsRecursive;
+
+        @Override
+        public AgentSummary spawnAgent(AgentSpawnRequest request) {
+            this.spawnRequest = request;
+            Instant now = Instant.parse("2026-04-01T00:00:00Z");
+            return new AgentSummary(new ThreadId("agent-1"), request.parentThreadId(), "inspector", "reviewer", "subdir", 1, AgentStatus.IDLE, now, now, null);
+        }
+
+        @Override
+        public AgentSummary sendInput(ThreadId agentThreadId, AgentMessage message, boolean interrupt) {
+            this.sendInputThreadId = agentThreadId;
+            this.sendInputMessage = message;
+            Instant now = Instant.parse("2026-04-01T00:01:00Z");
+            return new AgentSummary(agentThreadId, message == null ? null : message.senderThreadId(), "inspector", "reviewer", "subdir", 1, AgentStatus.RUNNING, now, now, null);
+        }
+
+        @Override
+        public AgentWaitResult waitAgent(List<ThreadId> agentThreadIds, long timeoutMillis) {
+            this.waitThreadIds = agentThreadIds == null ? List.of() : List.copyOf(agentThreadIds);
+            this.waitTimeoutMillis = timeoutMillis;
+            ThreadId threadId = this.waitThreadIds.isEmpty() ? null : this.waitThreadIds.get(0);
+            return new AgentWaitResult(threadId, new TurnId("turn-1"), AgentStatus.RUNNING, AgentStatus.WAITING, false, "Agent mailbox changed.", "turn completed", Instant.parse("2026-04-01T00:02:00Z"));
+        }
+
+        @Override
+        public AgentSummary resumeAgent(ThreadId agentThreadId) {
+            this.resumeThreadId = agentThreadId;
+            Instant now = Instant.parse("2026-04-01T00:03:00Z");
+            return new AgentSummary(agentThreadId, new ThreadId("thread-parent"), "inspector", "reviewer", "subdir", 1, AgentStatus.IDLE, now, now, null);
+        }
+
+        @Override
+        public AgentSummary closeAgent(ThreadId agentThreadId) {
+            this.closeThreadId = agentThreadId;
+            Instant now = Instant.parse("2026-04-01T00:04:00Z");
+            return new AgentSummary(agentThreadId, new ThreadId("thread-parent"), "inspector", "reviewer", "subdir", 1, AgentStatus.SHUTDOWN, now, now, now);
+        }
+
+        @Override
+        public List<AgentSummary> listAgents(ThreadId parentThreadId, boolean recursive) {
+            this.listAgentsParentThreadId = parentThreadId;
+            this.listAgentsRecursive = recursive;
+            return List.of(
+                    new AgentSummary(new ThreadId("agent-1"), parentThreadId, "inspector", "reviewer", "subdir", 1, AgentStatus.IDLE, Instant.parse("2026-04-01T00:00:00Z"), Instant.parse("2026-04-01T00:01:00Z"), null));
+        }
+    }
+
     private static final class NoOpThreadContextReconstructionService implements ThreadContextReconstructionService {
 
         @Override
@@ -716,13 +1003,12 @@ class SpringAiCodexAgentTest {
                                            org.dean.codex.core.tool.local.FileWriterTool fileWriterTool,
                                            ShellCommandTool shellCommandTool,
                                            CommandApprovalService commandApprovalService,
+                                           AgentControl agentControl,
                                            ThreadContextReconstructionService threadContextReconstructionService,
                                            RecordingContextManager contextManager,
                                            SkillService skillService,
                                            Path workspaceRoot,
                                            CodexProperties codexProperties,
-                                           int maxSteps,
-                                           int maxActionsPerTurn,
                                            List<String> responses,
                                            List<Integer> expectedCompactionsAtDecision) {
             super(chatClientBuilder,
@@ -732,13 +1018,12 @@ class SpringAiCodexAgentTest {
                     fileWriterTool,
                     shellCommandTool,
                     commandApprovalService,
+                    agentControl,
                     threadContextReconstructionService,
                     contextManager,
                     skillService,
                     workspaceRoot,
-                    codexProperties,
-                    maxSteps,
-                    maxActionsPerTurn);
+                    codexProperties);
             this.responses = new ArrayDeque<>(responses);
             this.expectedCompactionsAtDecision = List.copyOf(expectedCompactionsAtDecision);
             this.contextManager = contextManager;
@@ -787,11 +1072,16 @@ class SpringAiCodexAgentTest {
     }
 
     private static CodexProperties defaultModelProperties() {
-        return codexProperties(0, 0);
+        return codexProperties(6, 2, 0, 0);
     }
 
-    private static CodexProperties codexProperties(int autoCompactTokenLimit, int contextWindow) {
+    private static CodexProperties codexProperties(int maxSteps,
+                                                   int maxActionsPerStep,
+                                                   int autoCompactTokenLimit,
+                                                   int contextWindow) {
         CodexProperties properties = new CodexProperties();
+        properties.getAgent().setMaxSteps(maxSteps);
+        properties.getAgent().setMaxActionsPerStep(maxActionsPerStep);
         properties.getModel().setAutoCompactTokenLimit(autoCompactTokenLimit);
         properties.getModel().setContextWindow(contextWindow);
         return properties;

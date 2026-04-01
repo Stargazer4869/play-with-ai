@@ -2,6 +2,7 @@ package org.dean.codex.core.conversation;
 
 import org.dean.codex.protocol.conversation.ConversationMessage;
 import org.dean.codex.protocol.conversation.ConversationTurn;
+import org.dean.codex.protocol.appserver.ThreadForkParams;
 import org.dean.codex.protocol.conversation.ThreadId;
 import org.dean.codex.protocol.conversation.ThreadSummary;
 import org.dean.codex.protocol.conversation.TurnId;
@@ -16,6 +17,22 @@ import java.util.stream.Stream;
 public interface ConversationStore {
 
     ThreadId createThread(String title);
+
+    ThreadId forkThread(ThreadForkParams params);
+
+    ThreadSummary archiveThread(ThreadId threadId);
+
+    ThreadSummary unarchiveThread(ThreadId threadId);
+
+    ThreadSummary rollbackThread(ThreadId threadId, int numTurns);
+
+    ThreadSummary updateAgentThread(ThreadId threadId,
+                                    ThreadId parentThreadId,
+                                    Integer agentDepth,
+                                    Instant agentClosedAt,
+                                    String agentNickname,
+                                    String agentRole,
+                                    String agentPath);
 
     boolean exists(ThreadId threadId);
 

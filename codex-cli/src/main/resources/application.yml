@@ -20,7 +20,3 @@ codex:
     workspace-relative-root: ${CODEX_WORKSPACE_SKILLS_ROOT:.codex/skills}
   context:
     preserve-recent-turns: ${CODEX_CONTEXT_PRESERVE_RECENT_TURNS:4}
-  agent:
-    max-steps: 100
-    max-actions-per-turn: 3
-    history-window: 8

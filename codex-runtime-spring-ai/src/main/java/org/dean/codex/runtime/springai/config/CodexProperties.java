@@ -1,5 +1,6 @@
 package org.dean.codex.runtime.springai.config;
 
+import org.springframework.boot.context.properties.DeprecatedConfigurationProperty;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
 @ConfigurationProperties(prefix = "codex")
@@ -50,9 +51,10 @@ public class CodexProperties {
     }
 
     public static class Agent {
-        private int maxSteps = 10;
-        private int maxActionsPerTurn = 3;
+        private int maxSteps = 100;
+        private int maxActionsPerStep = 3;
         private int historyWindow = 8;
+        private int maxDepth = 4;
 
         public int getMaxSteps() {
             return maxSteps;
@@ -62,12 +64,23 @@ public class CodexProperties {
             this.maxSteps = maxSteps;
         }
 
-        public int getMaxActionsPerTurn() {
-            return maxActionsPerTurn;
+        public int getMaxActionsPerStep() {
+            return maxActionsPerStep;
         }
 
+        public void setMaxActionsPerStep(int maxActionsPerStep) {
+            this.maxActionsPerStep = maxActionsPerStep;
+        }
+
+        @Deprecated
+        @DeprecatedConfigurationProperty(replacement = "codex.agent.max-actions-per-step")
+        public int getMaxActionsPerTurn() {
+            return getMaxActionsPerStep();
+        }
+
+        @Deprecated
         public void setMaxActionsPerTurn(int maxActionsPerTurn) {
-            this.maxActionsPerTurn = maxActionsPerTurn;
+            setMaxActionsPerStep(maxActionsPerTurn);
         }
 
         public int getHistoryWindow() {
@@ -77,11 +90,19 @@ public class CodexProperties {
         public void setHistoryWindow(int historyWindow) {
             this.historyWindow = historyWindow;
         }
+
+        public int getMaxDepth() {
+            return maxDepth;
+        }
+
+        public void setMaxDepth(int maxDepth) {
+            this.maxDepth = maxDepth;
+        }
     }
 
     public static class Model {
-        private int contextWindow = 0;
-        private int autoCompactTokenLimit = 0;
+        private int contextWindow = 272_000;
+        private int autoCompactTokenLimit = 200_000;
 
         public int getContextWindow() {
             return contextWindow;

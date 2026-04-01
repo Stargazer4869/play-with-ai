@@ -8,11 +8,17 @@ import org.dean.codex.protocol.appserver.AppServerNotification;
 import org.dean.codex.protocol.appserver.InitializeParams;
 import org.dean.codex.protocol.appserver.InitializedNotification;
 import org.dean.codex.protocol.appserver.SkillsListParams;
+import org.dean.codex.protocol.appserver.ThreadArchiveParams;
 import org.dean.codex.protocol.appserver.ThreadCompactStartParams;
+import org.dean.codex.protocol.appserver.ThreadForkParams;
+import org.dean.codex.protocol.appserver.ThreadListParams;
 import org.dean.codex.protocol.appserver.ThreadListResponse;
+import org.dean.codex.protocol.appserver.ThreadLoadedListParams;
 import org.dean.codex.protocol.appserver.ThreadReadParams;
+import org.dean.codex.protocol.appserver.ThreadRollbackParams;
 import org.dean.codex.protocol.appserver.ThreadResumeParams;
 import org.dean.codex.protocol.appserver.ThreadStartParams;
+import org.dean.codex.protocol.appserver.ThreadUnarchiveParams;
 import org.dean.codex.protocol.appserver.TurnInterruptParams;
 import org.dean.codex.protocol.appserver.TurnResumeParams;
 import org.dean.codex.protocol.appserver.TurnStartParams;
@@ -67,6 +73,11 @@ public class JsonRpcAppServerConnection implements AutoCloseable {
                         null));
             }
         }
+        catch (NoSuchMethodException exception) {
+            if (!message.isNotification()) {
+                writeError(requestId, METHOD_NOT_FOUND, exception.getMessage());
+            }
+        }
         catch (IllegalArgumentException exception) {
             if (!message.isNotification()) {
                 writeError(requestId, INVALID_PARAMS, exception.getMessage());
@@ -74,7 +85,7 @@ public class JsonRpcAppServerConnection implements AutoCloseable {
         }
         catch (UnsupportedOperationException exception) {
             if (!message.isNotification()) {
-                writeError(requestId, METHOD_NOT_FOUND, exception.getMessage());
+                writeError(requestId, SERVER_ERROR, exception.getMessage());
             }
         }
         catch (IllegalStateException exception) {
@@ -102,7 +113,7 @@ public class JsonRpcAppServerConnection implements AutoCloseable {
         session.close();
     }
 
-    private Object dispatch(JsonRpcRequestMessage message) throws IOException {
+    private Object dispatch(JsonRpcRequestMessage message) throws Exception {
         return switch (message.method()) {
             case "initialize" -> session.initialize(readParams(message.params(), InitializeParams.class));
             case "initialized" -> {
@@ -112,15 +123,20 @@ public class JsonRpcAppServerConnection implements AutoCloseable {
             }
             case "thread/start" -> session.threadStart(readParams(message.params(), ThreadStartParams.class));
             case "thread/resume" -> session.threadResume(readParams(message.params(), ThreadResumeParams.class));
-            case "thread/list" -> session.threadList();
+            case "thread/list" -> session.threadList(readParams(message.params(), ThreadListParams.class));
+            case "thread/loaded/list" -> session.threadLoadedList(readParams(message.params(), ThreadLoadedListParams.class));
             case "thread/read" -> session.threadRead(readParams(message.params(), ThreadReadParams.class));
+            case "thread/fork" -> session.threadFork(readParams(message.params(), ThreadForkParams.class));
+            case "thread/archive" -> session.threadArchive(readParams(message.params(), ThreadArchiveParams.class));
+            case "thread/unarchive" -> session.threadUnarchive(readParams(message.params(), ThreadUnarchiveParams.class));
+            case "thread/rollback" -> session.threadRollback(readParams(message.params(), ThreadRollbackParams.class));
             case "thread/compact/start" -> session.threadCompactStart(readParams(message.params(), ThreadCompactStartParams.class));
             case "turn/start" -> session.turnStart(readParams(message.params(), TurnStartParams.class));
             case "turn/resume" -> session.turnResume(readParams(message.params(), TurnResumeParams.class));
             case "turn/interrupt" -> session.turnInterrupt(readParams(message.params(), TurnInterruptParams.class));
             case "turn/steer" -> session.turnSteer(readParams(message.params(), TurnSteerParams.class));
             case "skills/list" -> session.skillsList(readParams(message.params(), SkillsListParams.class));
-            default -> throw new UnsupportedOperationException("Method not found: " + message.method());
+            default -> throw new NoSuchMethodException("Method not found: " + message.method());
         };
     }
 

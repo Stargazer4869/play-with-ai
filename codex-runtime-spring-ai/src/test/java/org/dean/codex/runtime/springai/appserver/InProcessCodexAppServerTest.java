@@ -8,6 +8,7 @@ import org.dean.codex.core.context.ContextManager;
 import org.dean.codex.core.context.ThreadContextReconstructionService;
 import org.dean.codex.core.conversation.ConversationStore;
 import org.dean.codex.core.conversation.InMemoryConversationStore;
+import org.dean.codex.core.runtime.CodexRuntimeGateway;
 import org.dean.codex.core.skill.ResolvedSkill;
 import org.dean.codex.core.skill.SkillService;
 import org.dean.codex.protocol.appserver.AppServerCapabilities;
@@ -16,19 +17,34 @@ import org.dean.codex.protocol.appserver.AppServerNotification;
 import org.dean.codex.protocol.appserver.InitializeParams;
 import org.dean.codex.protocol.appserver.InitializedNotification;
 import org.dean.codex.protocol.appserver.SkillsListParams;
+import org.dean.codex.protocol.appserver.ThreadArchiveParams;
 import org.dean.codex.protocol.appserver.ThreadCompaction;
 import org.dean.codex.protocol.appserver.ThreadCompactStartParams;
 import org.dean.codex.protocol.appserver.ThreadCompactionStartedNotification;
 import org.dean.codex.protocol.appserver.ThreadCompactedNotification;
+import org.dean.codex.protocol.appserver.ThreadForkParams;
+import org.dean.codex.protocol.appserver.ThreadListParams;
+import org.dean.codex.protocol.appserver.ThreadLoadedListParams;
+import org.dean.codex.protocol.appserver.ThreadReadParams;
+import org.dean.codex.protocol.appserver.ThreadRollbackParams;
+import org.dean.codex.protocol.appserver.ThreadResumeParams;
+import org.dean.codex.protocol.appserver.ThreadSortKey;
 import org.dean.codex.protocol.appserver.ThreadStartParams;
 import org.dean.codex.protocol.appserver.ThreadStartedNotification;
+import org.dean.codex.protocol.appserver.ThreadSourceKind;
+import org.dean.codex.protocol.appserver.ThreadUnarchiveParams;
 import org.dean.codex.protocol.appserver.TurnCompletedNotification;
 import org.dean.codex.protocol.appserver.TurnItemNotification;
 import org.dean.codex.protocol.appserver.TurnStartParams;
 import org.dean.codex.protocol.appserver.TurnStartedNotification;
 import org.dean.codex.protocol.appserver.TurnSteerParams;
+import org.dean.codex.protocol.agent.AgentSpawnRequest;
+import org.dean.codex.protocol.conversation.ConversationTurn;
 import org.dean.codex.protocol.conversation.ItemId;
 import org.dean.codex.protocol.conversation.ThreadId;
+import org.dean.codex.protocol.conversation.ThreadSource;
+import org.dean.codex.protocol.conversation.ThreadStatus;
+import org.dean.codex.protocol.conversation.ThreadSummary;
 import org.dean.codex.protocol.conversation.TurnId;
 import org.dean.codex.protocol.conversation.TurnStatus;
 import org.dean.codex.protocol.context.ReconstructedThreadContext;
@@ -54,6 +70,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class InProcessCodexAppServerTest {
@@ -70,6 +87,48 @@ class InProcessCodexAppServerTest {
             assertNotNull(notification);
             assertTrue(notification instanceof ThreadStartedNotification);
             assertEquals(threadId, ((ThreadStartedNotification) notification).thread().threadId());
+        }
+    }
+
+    @Test
+    void threadForkPublishesStartedNotificationAndDivergesFromParent() throws Exception {
+        CodexAppServer appServer = appServer(new NoOpTurnExecutor());
+        BlockingQueue<AppServerNotification> notifications = new LinkedBlockingQueue<>();
+
+        try (CodexAppServerSession session = initializedSession(appServer);
+             AutoCloseable ignored = session.subscribe(notifications::add)) {
+            ThreadId parentThreadId = session.threadStart(new ThreadStartParams("Parent thread")).thread().threadId();
+            session.turnStart(new TurnStartParams(parentThreadId, "Inspect repo"));
+
+            var forked = session.threadFork(new ThreadForkParams(
+                    parentThreadId,
+                    "Forked thread",
+                    Boolean.TRUE,
+                    "/workspace/forked",
+                    "openai",
+                    "gpt-5.4",
+                    ThreadSource.APP_SERVER,
+                    "worker-1",
+                    "worker",
+                    "root/worker-1")).thread();
+
+            assertEquals("Forked thread", forked.title());
+            assertEquals("/workspace/forked", forked.cwd());
+            assertTrue(forked.ephemeral());
+
+            List<AppServerNotification> observed = awaitNotifications(notifications, 4);
+            assertTrue(observed.stream().anyMatch(notification ->
+                    notification instanceof ThreadStartedNotification started
+                            && started.thread().threadId().equals(forked.threadId())));
+
+            var forkedRead = session.threadRead(new ThreadReadParams(forked.threadId(), true));
+            assertEquals(1, forkedRead.turns().size());
+            assertTrue(session.threadLoadedList(new ThreadLoadedListParams()).data().contains(forked.threadId()));
+
+            session.turnStart(new TurnStartParams(forked.threadId(), "Write follow-up"));
+
+            assertEquals(1, session.threadRead(new ThreadReadParams(parentThreadId, true)).turns().size());
+            assertEquals(2, session.threadRead(new ThreadReadParams(forked.threadId(), true)).turns().size());
         }
     }
 
@@ -140,6 +199,255 @@ class InProcessCodexAppServerTest {
     }
 
     @Test
+    void threadListFiltersAndReadIncludeTurnsFlowThroughAppServerContract() throws Exception {
+        CodexAppServer appServer = appServer(new NoOpTurnExecutor());
+
+        try (CodexAppServerSession session = initializedSession(appServer)) {
+            ThreadId threadId = session.threadStart(new ThreadStartParams("Alpha thread")).thread().threadId();
+            session.turnStart(new TurnStartParams(threadId, "Inspect transport"));
+            session.threadStart(new ThreadStartParams("Beta thread"));
+
+            var filtered = session.threadList(new ThreadListParams(
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    Boolean.FALSE,
+                    null,
+                    "inspect"));
+            assertEquals(1, filtered.threads().size());
+            assertEquals(threadId, filtered.threads().get(0).threadId());
+            assertNull(filtered.nextCursor());
+
+            var metadataOnly = session.threadRead(new ThreadReadParams(threadId, false));
+            assertTrue(metadataOnly.turns().isEmpty());
+            assertNull(metadataOnly.threadMemory());
+            assertNull(metadataOnly.reconstructedContext());
+            assertEquals(threadId, metadataOnly.treeRootThreadId());
+            assertTrue(metadataOnly.relatedThreads().isEmpty());
+
+            var withTurns = session.threadRead(new ThreadReadParams(threadId, true));
+            assertEquals(1, withTurns.turns().size());
+            assertNotNull(withTurns.threadMemory());
+            assertNotNull(withTurns.reconstructedContext());
+            assertEquals(threadId, withTurns.treeRootThreadId());
+            assertTrue(withTurns.relatedThreads().isEmpty());
+
+            var loaded = session.threadLoadedList(new ThreadLoadedListParams());
+            assertTrue(loaded.data().contains(threadId));
+        }
+    }
+
+    @Test
+    void threadResumeBackfillsSubAgentSubscriptionsAndThreadReadReturnsTreeNavigation() throws Exception {
+        ConversationStore conversationStore = new InMemoryConversationStore();
+        DefaultCodexRuntimeGateway runtimeGateway = new DefaultCodexRuntimeGateway(
+                conversationStore,
+                new NoOpTurnExecutor(),
+                new NoOpContextManager(),
+                new NoOpThreadContextReconstructionService(),
+                new NoOpSkillService());
+        ThreadId parentThreadId = runtimeGateway.threadStart("Parent thread").threadId();
+        ThreadId childThreadId = runtimeGateway.spawnAgent(new AgentSpawnRequest(
+                parentThreadId,
+                "root/worker-1",
+                "Investigate the failing tests",
+                "worker-1",
+                "worker",
+                null,
+                null,
+                null,
+                null)).threadId();
+
+        CodexAppServer appServer = new InProcessCodexAppServer(runtimeGateway);
+        BlockingQueue<AppServerNotification> notifications = new LinkedBlockingQueue<>();
+
+        try (CodexAppServerSession session = initializedSession(appServer);
+             AutoCloseable ignored = session.subscribe(notifications::add)) {
+            session.threadResume(new ThreadResumeParams(parentThreadId));
+
+            var parentRead = session.threadRead(new ThreadReadParams(parentThreadId, false));
+            assertEquals(parentThreadId, parentRead.treeRootThreadId());
+            assertTrue(parentRead.relatedThreads().stream().anyMatch(summary -> summary.threadId().equals(childThreadId)));
+
+            var childRead = session.threadRead(new ThreadReadParams(childThreadId, false));
+            assertEquals(parentThreadId, childRead.treeRootThreadId());
+            assertTrue(childRead.relatedThreads().stream().anyMatch(summary -> summary.threadId().equals(parentThreadId)));
+
+            assertTrue(session.threadLoadedList(new ThreadLoadedListParams()).data().contains(childThreadId));
+
+            runtimeGateway.turnStart(childThreadId, "Follow up on the investigation");
+
+            List<AppServerNotification> observed = awaitNotifications(notifications, 3);
+            assertTrue(observed.stream().anyMatch(notification ->
+                    notification instanceof TurnStartedNotification started
+                            && started.turn().threadId().equals(childThreadId)));
+            assertTrue(observed.stream().anyMatch(notification ->
+                    notification instanceof TurnCompletedNotification completed
+                            && completed.turn().threadId().equals(childThreadId)));
+        }
+    }
+
+    @Test
+    void threadArchiveUnarchiveAndRollbackFlowThroughAppServerContract() throws Exception {
+        CodexAppServer appServer = appServer(new NoOpTurnExecutor());
+
+        try (CodexAppServerSession session = initializedSession(appServer)) {
+            ThreadId threadId = session.threadStart(new ThreadStartParams("Lifecycle thread")).thread().threadId();
+            session.turnStart(new TurnStartParams(threadId, "Inspect repo"));
+            session.turnStart(new TurnStartParams(threadId, "Run tests"));
+
+            var archived = session.threadArchive(new ThreadArchiveParams(threadId)).thread();
+            assertTrue(archived.archived());
+            assertFalse(session.threadLoadedList(new ThreadLoadedListParams()).data().contains(threadId));
+            assertTrue(session.threadList(new ThreadListParams(null, null, null, null, null, null, null, null)).threads().isEmpty());
+            assertEquals(List.of(threadId),
+                    session.threadList(new ThreadListParams(null, null, null, null, null, Boolean.TRUE, null, null)).threads()
+                            .stream()
+                            .map(ThreadSummary::threadId)
+                            .toList());
+
+            var unarchived = session.threadUnarchive(new ThreadUnarchiveParams(threadId)).thread();
+            assertFalse(unarchived.archived());
+
+            var rollback = session.threadRollback(new ThreadRollbackParams(threadId, 1));
+            assertEquals(1, rollback.thread().turnCount());
+            assertEquals(1, rollback.turns().size());
+            assertEquals("Inspect repo", rollback.turns().get(0).userInput());
+        }
+    }
+
+    @Test
+    void threadListSupportsFilteringAndPaginationCursor() throws Exception {
+        Instant base = Instant.parse("2026-04-01T00:00:00Z");
+        ThreadSummary alpha = new ThreadSummary(
+                new ThreadId("thread-alpha"),
+                "Alpha thread",
+                base.plusSeconds(10),
+                base.plusSeconds(30),
+                1,
+                "Alpha preview",
+                false,
+                "openai",
+                "gpt-5.4",
+                ThreadStatus.NOT_LOADED,
+                List.of(),
+                "/tmp/threads/thread-alpha",
+                "/workspace/a",
+                ThreadSource.CLI,
+                true,
+                null,
+                null,
+                null,
+                null);
+        ThreadSummary beta = new ThreadSummary(
+                new ThreadId("thread-beta"),
+                "Beta thread",
+                base.plusSeconds(20),
+                base.plusSeconds(40),
+                2,
+                "Beta preview",
+                false,
+                "openai",
+                "gpt-5.4",
+                ThreadStatus.NOT_LOADED,
+                List.of(),
+                "/tmp/threads/thread-beta",
+                "/workspace/a",
+                ThreadSource.CLI,
+                true,
+                null,
+                null,
+                null,
+                null);
+        ThreadSummary archived = new ThreadSummary(
+                new ThreadId("thread-archived"),
+                "Archived thread",
+                base.plusSeconds(30),
+                base.plusSeconds(50),
+                3,
+                "Archived alpha preview",
+                false,
+                "anthropic",
+                "claude-sonnet",
+                ThreadStatus.NOT_LOADED,
+                List.of(),
+                "/tmp/threads/thread-archived",
+                "/workspace/b",
+                ThreadSource.SUB_AGENT,
+                true,
+                base.plusSeconds(60),
+                null,
+                null,
+                null);
+        CodexRuntimeGateway gateway = new StubThreadListRuntimeGateway(List.of(alpha, beta, archived));
+        CodexAppServer appServer = appServer(gateway);
+
+        try (CodexAppServerSession session = initializedSession(appServer)) {
+            var filtered = session.threadList(new ThreadListParams(
+                    null,
+                    10,
+                    ThreadSortKey.CREATED_AT,
+                    List.of("openai"),
+                    List.of(ThreadSourceKind.CLI),
+                    Boolean.FALSE,
+                    "/workspace/a",
+                    "alpha"));
+            assertEquals(1, filtered.threads().size());
+            assertEquals(alpha.threadId(), filtered.threads().get(0).threadId());
+            assertNull(filtered.nextCursor());
+
+            var firstPage = session.threadList(new ThreadListParams(
+                    null,
+                    1,
+                    ThreadSortKey.CREATED_AT,
+                    null,
+                    List.of(ThreadSourceKind.CLI),
+                    Boolean.FALSE,
+                    null,
+                    null));
+            assertEquals(1, firstPage.threads().size());
+            assertEquals(beta.threadId(), firstPage.threads().get(0).threadId());
+            assertEquals("1", firstPage.nextCursor());
+
+            var secondPage = session.threadList(new ThreadListParams(
+                    firstPage.nextCursor(),
+                    1,
+                    ThreadSortKey.CREATED_AT,
+                    null,
+                    List.of(ThreadSourceKind.CLI),
+                    Boolean.FALSE,
+                    null,
+                    null));
+            assertEquals(1, secondPage.threads().size());
+            assertEquals(alpha.threadId(), secondPage.threads().get(0).threadId());
+            assertNull(secondPage.nextCursor());
+        }
+    }
+
+    @Test
+    void threadReadDoesNotLoadPersistedThreadButThreadResumeDoes() throws Exception {
+        ConversationStore store = new InMemoryConversationStore();
+        ThreadId threadId = store.createThread("Persisted thread");
+        CodexAppServer appServer = appServer(store, new NoOpTurnExecutor());
+
+        try (CodexAppServerSession session = initializedSession(appServer)) {
+            var metadataOnly = session.threadRead(new ThreadReadParams(threadId, false));
+            assertEquals(threadId, metadataOnly.thread().threadId());
+
+            var loadedBeforeResume = session.threadLoadedList(new ThreadLoadedListParams());
+            assertFalse(loadedBeforeResume.data().contains(threadId));
+
+            var resumed = session.threadResume(new ThreadResumeParams(threadId));
+            assertEquals(threadId, resumed.thread().threadId());
+
+            var loadedAfterResume = session.threadLoadedList(new ThreadLoadedListParams());
+            assertTrue(loadedAfterResume.data().contains(threadId));
+        }
+    }
+
+    @Test
     void sessionRejectsOperationalCallsBeforeInitialization() throws Exception {
         CodexAppServer appServer = appServer(new NoOpTurnExecutor());
 
@@ -180,7 +488,14 @@ class InProcessCodexAppServerTest {
     }
 
     private CodexAppServer appServer(TurnExecutor turnExecutor) {
-        ConversationStore store = new InMemoryConversationStore();
+        return appServer(new InMemoryConversationStore(), turnExecutor);
+    }
+
+    private CodexAppServer appServer(CodexRuntimeGateway runtimeGateway) {
+        return new InProcessCodexAppServer(runtimeGateway);
+    }
+
+    private CodexAppServer appServer(ConversationStore store, TurnExecutor turnExecutor) {
         SkillService skillService = new SkillService() {
             @Override
             public List<SkillMetadata> listSkills(boolean forceReload) {
@@ -211,6 +526,85 @@ class InProcessCodexAppServerTest {
                 List.of(),
                 Instant.now());
         return new InProcessCodexAppServer(new DefaultCodexRuntimeGateway(store, turnExecutor, contextManager, reconstructionService, skillService));
+    }
+
+    private static final class StubThreadListRuntimeGateway implements CodexRuntimeGateway {
+
+        private final List<ThreadSummary> threads;
+
+        private StubThreadListRuntimeGateway(List<ThreadSummary> threads) {
+            this.threads = List.copyOf(threads);
+        }
+
+        @Override
+        public ThreadSummary threadStart(String title) {
+            throw new UnsupportedOperationException("Not used in this test");
+        }
+
+        @Override
+        public ThreadSummary threadResume(ThreadId threadId) {
+            throw new UnsupportedOperationException("Not used in this test");
+        }
+
+        @Override
+        public List<ThreadSummary> listThreads() {
+            return threads;
+        }
+
+        @Override
+        public List<ConversationTurn> turns(ThreadId threadId) {
+            throw new UnsupportedOperationException("Not used in this test");
+        }
+
+        @Override
+        public ConversationTurn turn(ThreadId threadId, TurnId turnId) {
+            throw new UnsupportedOperationException("Not used in this test");
+        }
+
+        @Override
+        public ReconstructedThreadContext reconstructThreadContext(ThreadId threadId) {
+            throw new UnsupportedOperationException("Not used in this test");
+        }
+
+        @Override
+        public Optional<ThreadMemory> latestThreadMemory(ThreadId threadId) {
+            return Optional.empty();
+        }
+
+        @Override
+        public ThreadMemory compactThread(ThreadId threadId) {
+            throw new UnsupportedOperationException("Not used in this test");
+        }
+
+        @Override
+        public List<SkillMetadata> listSkills(boolean forceReload) {
+            return List.of();
+        }
+
+        @Override
+        public org.dean.codex.protocol.runtime.RuntimeTurn turnStart(ThreadId threadId, String input) {
+            throw new UnsupportedOperationException("Not used in this test");
+        }
+
+        @Override
+        public org.dean.codex.protocol.runtime.RuntimeTurn turnResume(ThreadId threadId, TurnId turnId) {
+            throw new UnsupportedOperationException("Not used in this test");
+        }
+
+        @Override
+        public boolean turnSteer(ThreadId threadId, TurnId turnId, String input) {
+            throw new UnsupportedOperationException("Not used in this test");
+        }
+
+        @Override
+        public boolean turnInterrupt(ThreadId threadId, TurnId turnId) {
+            throw new UnsupportedOperationException("Not used in this test");
+        }
+
+        @Override
+        public AutoCloseable subscribe(ThreadId threadId, Consumer<org.dean.codex.protocol.runtime.RuntimeNotification> listener) {
+            throw new UnsupportedOperationException("Not used in this test");
+        }
     }
 
     private CodexAppServerSession initializedSession(CodexAppServer appServer) {
@@ -264,6 +658,37 @@ class InProcessCodexAppServerTest {
         @Override
         public CodexTurnResult resumeTurn(ThreadId threadId, TurnId turnId) {
             throw new UnsupportedOperationException();
+        }
+    }
+
+    private static final class NoOpSkillService implements SkillService {
+        @Override
+        public List<SkillMetadata> listSkills(boolean forceReload) {
+            return List.of();
+        }
+
+        @Override
+        public List<ResolvedSkill> resolveSkills(String input, boolean forceReload) {
+            return List.of();
+        }
+    }
+
+    private static final class NoOpContextManager implements ContextManager {
+        @Override
+        public Optional<ThreadMemory> latestThreadMemory(ThreadId threadId) {
+            return Optional.empty();
+        }
+
+        @Override
+        public ThreadMemory compactThread(ThreadId threadId) {
+            return new ThreadMemory("memory-0", threadId, "summary", List.of(), 0, Instant.now());
+        }
+    }
+
+    private static final class NoOpThreadContextReconstructionService implements ThreadContextReconstructionService {
+        @Override
+        public ReconstructedThreadContext reconstruct(ThreadId threadId) {
+            return new ReconstructedThreadContext(threadId, null, List.of(), List.of(), List.of(), Instant.now());
         }
     }
 

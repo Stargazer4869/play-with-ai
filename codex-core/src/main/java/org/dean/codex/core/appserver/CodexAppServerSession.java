@@ -6,15 +6,26 @@ import org.dean.codex.protocol.appserver.InitializeParams;
 import org.dean.codex.protocol.appserver.InitializeResponse;
 import org.dean.codex.protocol.appserver.SkillsListParams;
 import org.dean.codex.protocol.appserver.SkillsListResponse;
+import org.dean.codex.protocol.appserver.ThreadArchiveParams;
+import org.dean.codex.protocol.appserver.ThreadArchiveResponse;
 import org.dean.codex.protocol.appserver.ThreadCompactStartParams;
 import org.dean.codex.protocol.appserver.ThreadCompactStartResponse;
+import org.dean.codex.protocol.appserver.ThreadForkParams;
+import org.dean.codex.protocol.appserver.ThreadForkResponse;
+import org.dean.codex.protocol.appserver.ThreadListParams;
 import org.dean.codex.protocol.appserver.ThreadListResponse;
+import org.dean.codex.protocol.appserver.ThreadLoadedListParams;
+import org.dean.codex.protocol.appserver.ThreadLoadedListResponse;
 import org.dean.codex.protocol.appserver.ThreadReadParams;
 import org.dean.codex.protocol.appserver.ThreadReadResponse;
+import org.dean.codex.protocol.appserver.ThreadRollbackParams;
+import org.dean.codex.protocol.appserver.ThreadRollbackResponse;
 import org.dean.codex.protocol.appserver.ThreadResumeParams;
 import org.dean.codex.protocol.appserver.ThreadResumeResponse;
 import org.dean.codex.protocol.appserver.ThreadStartParams;
 import org.dean.codex.protocol.appserver.ThreadStartResponse;
+import org.dean.codex.protocol.appserver.ThreadUnarchiveParams;
+import org.dean.codex.protocol.appserver.ThreadUnarchiveResponse;
 import org.dean.codex.protocol.appserver.TurnInterruptParams;
 import org.dean.codex.protocol.appserver.TurnInterruptResponse;
 import org.dean.codex.protocol.appserver.TurnResumeParams;
@@ -36,9 +47,23 @@ public interface CodexAppServerSession extends AutoCloseable {
 
     ThreadResumeResponse threadResume(ThreadResumeParams params);
 
-    ThreadListResponse threadList();
+    default ThreadListResponse threadList() {
+        return threadList(null);
+    }
+
+    ThreadListResponse threadList(ThreadListParams params);
+
+    ThreadLoadedListResponse threadLoadedList(ThreadLoadedListParams params);
 
     ThreadReadResponse threadRead(ThreadReadParams params);
+
+    ThreadForkResponse threadFork(ThreadForkParams params);
+
+    ThreadArchiveResponse threadArchive(ThreadArchiveParams params);
+
+    ThreadUnarchiveResponse threadUnarchive(ThreadUnarchiveParams params);
+
+    ThreadRollbackResponse threadRollback(ThreadRollbackParams params);
 
     ThreadCompactStartResponse threadCompactStart(ThreadCompactStartParams params);
 

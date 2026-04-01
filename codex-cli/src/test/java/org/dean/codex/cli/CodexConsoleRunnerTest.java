@@ -11,19 +11,30 @@ import org.dean.codex.protocol.appserver.InitializeResponse;
 import org.dean.codex.protocol.appserver.InitializedNotification;
 import org.dean.codex.protocol.appserver.SkillsListParams;
 import org.dean.codex.protocol.appserver.SkillsListResponse;
+import org.dean.codex.protocol.appserver.ThreadArchiveParams;
+import org.dean.codex.protocol.appserver.ThreadArchiveResponse;
 import org.dean.codex.protocol.appserver.ThreadCompaction;
 import org.dean.codex.protocol.appserver.ThreadCompactStartParams;
 import org.dean.codex.protocol.appserver.ThreadCompactStartResponse;
 import org.dean.codex.protocol.appserver.ThreadCompactionStartedNotification;
 import org.dean.codex.protocol.appserver.ThreadCompactedNotification;
+import org.dean.codex.protocol.appserver.ThreadForkParams;
+import org.dean.codex.protocol.appserver.ThreadForkResponse;
+import org.dean.codex.protocol.appserver.ThreadListParams;
 import org.dean.codex.protocol.appserver.ThreadListResponse;
+import org.dean.codex.protocol.appserver.ThreadLoadedListParams;
+import org.dean.codex.protocol.appserver.ThreadLoadedListResponse;
 import org.dean.codex.protocol.appserver.ThreadReadParams;
 import org.dean.codex.protocol.appserver.ThreadReadResponse;
+import org.dean.codex.protocol.appserver.ThreadRollbackParams;
+import org.dean.codex.protocol.appserver.ThreadRollbackResponse;
 import org.dean.codex.protocol.appserver.ThreadResumeParams;
 import org.dean.codex.protocol.appserver.ThreadResumeResponse;
 import org.dean.codex.protocol.appserver.ThreadStartParams;
 import org.dean.codex.protocol.appserver.ThreadStartResponse;
 import org.dean.codex.protocol.appserver.ThreadStartedNotification;
+import org.dean.codex.protocol.appserver.ThreadUnarchiveParams;
+import org.dean.codex.protocol.appserver.ThreadUnarchiveResponse;
 import org.dean.codex.protocol.appserver.TurnCompletedNotification;
 import org.dean.codex.protocol.appserver.TurnInterruptParams;
 import org.dean.codex.protocol.appserver.TurnInterruptResponse;
@@ -37,9 +48,12 @@ import org.dean.codex.protocol.conversation.ConversationTurn;
 import org.dean.codex.protocol.approval.ApprovalId;
 import org.dean.codex.protocol.approval.ApprovalStatus;
 import org.dean.codex.protocol.approval.CommandApprovalRequest;
+import org.dean.codex.protocol.agent.AgentStatus;
 import org.dean.codex.protocol.context.ReconstructedThreadContext;
 import org.dean.codex.protocol.context.ThreadMemory;
 import org.dean.codex.protocol.conversation.ThreadId;
+import org.dean.codex.protocol.conversation.ThreadStatus;
+import org.dean.codex.protocol.conversation.ThreadSummary;
 import org.dean.codex.protocol.conversation.TurnId;
 import org.dean.codex.protocol.conversation.TurnStatus;
 import org.dean.codex.protocol.runtime.RuntimeTurn;
@@ -53,10 +67,13 @@ import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.Consumer;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -181,30 +198,172 @@ class CodexConsoleRunnerTest {
     void compactCommandPrintsCompactionLifecycleAndCompatibilitySnapshot() throws Exception {
         CodexConsoleRunner runner = new CodexConsoleRunner(new StubAppServer(), new StubApprovalService());
 
-        ByteArrayOutputStream output = new ByteArrayOutputStream();
-        PrintStream originalOut = System.out;
-        try {
-            System.setOut(new PrintStream(output, true, StandardCharsets.UTF_8));
-            assertTrue(runner.handleConsoleCommand(":compact"));
-        }
-        finally {
-            System.setOut(originalOut);
-        }
-
-        String console = output.toString(StandardCharsets.UTF_8);
+        String console = captureConsole(() -> assertTrue(runner.handleConsoleCommand(":compact")));
         assertTrue(console.contains("[compaction] started"));
         assertTrue(console.contains("[compaction] completed"));
         assertTrue(console.contains("[compaction] response"));
         assertTrue(console.contains("[memory] compatibility snapshot"));
     }
 
+    @Test
+    void resumeCommandSwitchesActiveThread() throws Exception {
+        StubAppServer runtime = new StubAppServer();
+        CodexConsoleRunner runner = new CodexConsoleRunner(runtime, new StubApprovalService());
+
+        String console = captureConsole(() -> assertTrue(runner.handleConsoleCommand(":resume " + shortId(runtime.subagentThreadId()))));
+
+        assertEquals(runtime.subagentThreadId(), runner.getActiveThreadIdForTest());
+        assertTrue(console.contains("Switched to thread"));
+    }
+
+    @Test
+    void forkCommandCreatesThreadAndSwitchesActiveThread() throws Exception {
+        StubAppServer runtime = new StubAppServer();
+        CodexConsoleRunner runner = new CodexConsoleRunner(runtime, new StubApprovalService());
+        ThreadId originalThread = runner.getActiveThreadIdForTest();
+
+        String console = captureConsole(() -> assertTrue(runner.handleConsoleCommand(":fork worker review")));
+
+        assertNotEquals(originalThread, runner.getActiveThreadIdForTest());
+        assertTrue(console.contains("Forked thread"));
+        assertTrue(console.contains("Switched to thread"));
+    }
+
+    @Test
+    void archiveCommandArchivesActiveThreadAndSwitchesContext() throws Exception {
+        StubAppServer runtime = new StubAppServer();
+        CodexConsoleRunner runner = new CodexConsoleRunner(runtime, new StubApprovalService());
+        ThreadId originalThread = runner.getActiveThreadIdForTest();
+
+        String console = captureConsole(() -> assertTrue(runner.handleConsoleCommand(":archive")));
+
+        assertNotEquals(originalThread, runner.getActiveThreadIdForTest());
+        assertTrue(console.contains("Archived thread"));
+        assertTrue(console.contains("Switched to thread"));
+    }
+
+    @Test
+    void rollbackCommandTrimsThreadHistory() throws Exception {
+        StubAppServer runtime = new StubAppServer();
+        CodexConsoleRunner runner = new CodexConsoleRunner(runtime, new StubApprovalService());
+        runtime.addCompletedTurn(runner.getActiveThreadIdForTest(), "Inspect repo");
+
+        String console = captureConsole(() -> assertTrue(runner.handleConsoleCommand(":rollback 1")));
+
+        assertEquals(0, runtime.turnCount(runner.getActiveThreadIdForTest()));
+        assertTrue(console.contains("Rolled back 1 turn(s)"));
+        assertTrue(console.contains("Remaining turns=0"));
+    }
+
+    @Test
+    void subagentsCommandPrintsThreadTree() throws Exception {
+        StubAppServer runtime = new StubAppServer();
+        CodexConsoleRunner runner = new CodexConsoleRunner(runtime, new StubApprovalService());
+
+        String console = captureConsole(() -> assertTrue(runner.handleConsoleCommand(":subagents")));
+
+        assertTrue(console.contains("Thread tree rooted at"));
+        assertTrue(console.contains("Worker thread"));
+        assertTrue(console.contains("role=explorer"));
+    }
+
+    @Test
+    void agentUseCommandSwitchesToSubagent() throws Exception {
+        StubAppServer runtime = new StubAppServer();
+        CodexConsoleRunner runner = new CodexConsoleRunner(runtime, new StubApprovalService());
+
+        String console = captureConsole(() -> assertTrue(runner.handleConsoleCommand(":agent use " + shortId(runtime.subagentThreadId()))));
+
+        assertEquals(runtime.subagentThreadId(), runner.getActiveThreadIdForTest());
+        assertTrue(console.contains("Switched to thread"));
+    }
+
+    private static String captureConsole(ThrowingRunnable action) throws Exception {
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        PrintStream originalOut = System.out;
+        try {
+            System.setOut(new PrintStream(output, true, StandardCharsets.UTF_8));
+            action.run();
+        }
+        finally {
+            System.setOut(originalOut);
+        }
+        return output.toString(StandardCharsets.UTF_8);
+    }
+
+    private static String shortId(ThreadId threadId) {
+        String value = threadId.value();
+        return value.length() <= 8 ? value : value.substring(0, 8);
+    }
+
     private static final class StubAppServer implements CodexAppServer {
 
         private final ConversationStore store = new InMemoryConversationStore();
+        private final Set<ThreadId> loadedThreadIds = new LinkedHashSet<>();
+        private final ThreadId rootThreadId;
+        private final ThreadId subagentThreadId;
+
+        private StubAppServer() {
+            this.rootThreadId = store.createThread("Thread 1");
+            this.subagentThreadId = store.createThread("Worker thread");
+            loadedThreadIds.add(rootThreadId);
+            loadedThreadIds.add(subagentThreadId);
+            store.updateAgentThread(subagentThreadId, rootThreadId, 1, null, "worker", "explorer", "src/demo");
+        }
+
+        private ThreadId subagentThreadId() {
+            return subagentThreadId;
+        }
+
+        private void addCompletedTurn(ThreadId threadId, String input) {
+            Instant now = Instant.now();
+            TurnId turnId = store.startTurn(threadId, input, now);
+            store.completeTurn(threadId, turnId, TurnStatus.COMPLETED, "handled: " + input, now.plusSeconds(1));
+        }
+
+        private int turnCount(ThreadId threadId) {
+            return store.turns(threadId).size();
+        }
 
         @Override
         public CodexAppServerSession connect() {
             return new StubSession();
+        }
+
+        private ThreadSummary requireThread(ThreadId threadId) {
+            return store.listThreads().stream()
+                    .filter(summary -> summary.threadId().equals(threadId))
+                    .findFirst()
+                    .orElseThrow();
+        }
+
+        private ThreadSummary runtimeSummary(ThreadId threadId) {
+            return runtimeSummary(requireThread(threadId));
+        }
+
+        private ThreadSummary runtimeSummary(ThreadSummary thread) {
+            boolean loaded = loadedThreadIds.contains(thread.threadId()) && !thread.archived();
+            AgentStatus agentStatus = thread.parentThreadId() == null
+                    ? null
+                    : loaded ? AgentStatus.IDLE : thread.agentClosedAt() == null ? AgentStatus.PENDING_INIT : AgentStatus.SHUTDOWN;
+            return thread.withRuntime(loaded ? ThreadStatus.IDLE : ThreadStatus.NOT_LOADED, List.of(), agentStatus);
+        }
+
+        private ThreadId treeRoot(ThreadId threadId) {
+            ThreadSummary current = requireThread(threadId);
+            while (current.parentThreadId() != null) {
+                current = requireThread(current.parentThreadId());
+            }
+            return current.threadId();
+        }
+
+        private List<ThreadSummary> relatedThreads(ThreadId threadId) {
+            ThreadId root = treeRoot(threadId);
+            return store.listThreads().stream()
+                    .map(this::runtimeSummary)
+                    .filter(summary -> treeRoot(summary.threadId()).equals(root))
+                    .filter(summary -> !summary.threadId().equals(threadId))
+                    .toList();
         }
 
         private final class StubSession implements CodexAppServerSession {
@@ -239,10 +398,8 @@ class CodexConsoleRunnerTest {
                 ensureReady();
                 String title = params == null ? "" : params.title();
                 ThreadId threadId = store.createThread(title);
-                var thread = store.listThreads().stream()
-                        .filter(summary -> summary.threadId().equals(threadId))
-                        .findFirst()
-                        .orElseThrow();
+                loadedThreadIds.add(threadId);
+                var thread = runtimeSummary(threadId);
                 publish(threadId, new ThreadStartedNotification(thread));
                 return new ThreadStartResponse(thread);
             }
@@ -251,27 +408,82 @@ class CodexConsoleRunnerTest {
             public ThreadResumeResponse threadResume(ThreadResumeParams params) {
                 ensureReady();
                 ThreadId threadId = params.threadId();
-                return new ThreadResumeResponse(store.listThreads().stream()
-                        .filter(summary -> summary.threadId().equals(threadId))
-                        .findFirst()
-                        .orElseThrow());
+                if (requireThread(threadId).archived()) {
+                    throw new IllegalArgumentException("Archived thread id: " + threadId.value());
+                }
+                loadedThreadIds.add(threadId);
+                return new ThreadResumeResponse(runtimeSummary(threadId));
             }
 
             @Override
-            public ThreadListResponse threadList() {
+            public ThreadListResponse threadList(ThreadListParams params) {
                 ensureReady();
-                return new ThreadListResponse(store.listThreads());
+                boolean explicitArchivedFilter = params != null && params.archived() != null;
+                boolean archived = explicitArchivedFilter && params.archived();
+                List<ThreadSummary> threads = store.listThreads().stream()
+                        .map(StubAppServer.this::runtimeSummary)
+                        .filter(thread -> explicitArchivedFilter ? thread.archived() == archived : !thread.archived())
+                        .toList();
+                return new ThreadListResponse(threads, null);
+            }
+
+            @Override
+            public ThreadLoadedListResponse threadLoadedList(ThreadLoadedListParams params) {
+                ensureReady();
+                return new ThreadLoadedListResponse(
+                        store.listThreads().stream()
+                                .map(StubAppServer.this::runtimeSummary)
+                                .filter(ThreadSummary::loaded)
+                                .map(ThreadSummary::threadId)
+                                .toList(),
+                        null);
             }
 
             @Override
             public ThreadReadResponse threadRead(ThreadReadParams params) {
                 ensureReady();
                 ThreadId threadId = params.threadId();
+                List<ConversationTurn> turns = params.includeTurns() ? store.turns(threadId) : List.of();
+                ThreadMemory threadMemory = params.includeTurns() ? latestThreadMemory(threadId) : null;
+                ReconstructedThreadContext reconstructedContext = params.includeTurns()
+                        ? new ReconstructedThreadContext(threadId, threadMemory, List.of(), turns, List.of(), Instant.now())
+                        : null;
                 return new ThreadReadResponse(
-                        store.listThreads().stream().filter(summary -> summary.threadId().equals(threadId)).findFirst().orElseThrow(),
-                        store.turns(threadId),
-                        latestThreadMemory(threadId),
-                        new ReconstructedThreadContext(threadId, latestThreadMemory(threadId), List.of(), store.turns(threadId), List.of(), Instant.now()));
+                        runtimeSummary(threadId),
+                        turns,
+                        threadMemory,
+                        reconstructedContext,
+                        treeRoot(threadId),
+                        relatedThreads(threadId));
+            }
+
+            @Override
+            public ThreadForkResponse threadFork(ThreadForkParams params) {
+                ensureReady();
+                ThreadId threadId = store.forkThread(params);
+                loadedThreadIds.add(threadId);
+                return new ThreadForkResponse(runtimeSummary(threadId));
+            }
+
+            @Override
+            public ThreadArchiveResponse threadArchive(ThreadArchiveParams params) {
+                ensureReady();
+                loadedThreadIds.remove(params.threadId());
+                return new ThreadArchiveResponse(runtimeSummary(store.archiveThread(params.threadId())));
+            }
+
+            @Override
+            public ThreadUnarchiveResponse threadUnarchive(ThreadUnarchiveParams params) {
+                ensureReady();
+                return new ThreadUnarchiveResponse(runtimeSummary(store.unarchiveThread(params.threadId())));
+            }
+
+            @Override
+            public ThreadRollbackResponse threadRollback(ThreadRollbackParams params) {
+                ensureReady();
+                return new ThreadRollbackResponse(
+                        runtimeSummary(store.rollbackThread(params.threadId(), params.numTurns())),
+                        store.turns(params.threadId()));
             }
 
             @Override
@@ -467,5 +679,10 @@ class CodexConsoleRunnerTest {
                     "",
                     null);
         }
+    }
+
+    @FunctionalInterface
+    private interface ThrowingRunnable {
+        void run() throws Exception;
     }
 }

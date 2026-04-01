@@ -9,19 +9,32 @@ import org.dean.codex.protocol.appserver.InitializeResponse;
 import org.dean.codex.protocol.appserver.InitializedNotification;
 import org.dean.codex.protocol.appserver.SkillsListParams;
 import org.dean.codex.protocol.appserver.SkillsListResponse;
+import org.dean.codex.protocol.appserver.ThreadArchiveParams;
+import org.dean.codex.protocol.appserver.ThreadArchiveResponse;
 import org.dean.codex.protocol.appserver.ThreadCompaction;
 import org.dean.codex.protocol.appserver.ThreadCompactStartParams;
 import org.dean.codex.protocol.appserver.ThreadCompactStartResponse;
 import org.dean.codex.protocol.appserver.ThreadCompactionStartedNotification;
 import org.dean.codex.protocol.appserver.ThreadCompactedNotification;
+import org.dean.codex.protocol.appserver.ThreadForkParams;
+import org.dean.codex.protocol.appserver.ThreadForkResponse;
+import org.dean.codex.protocol.appserver.ThreadListParams;
 import org.dean.codex.protocol.appserver.ThreadListResponse;
+import org.dean.codex.protocol.appserver.ThreadLoadedListParams;
+import org.dean.codex.protocol.appserver.ThreadLoadedListResponse;
 import org.dean.codex.protocol.appserver.ThreadReadParams;
 import org.dean.codex.protocol.appserver.ThreadReadResponse;
+import org.dean.codex.protocol.appserver.ThreadRollbackParams;
+import org.dean.codex.protocol.appserver.ThreadRollbackResponse;
 import org.dean.codex.protocol.appserver.ThreadResumeParams;
 import org.dean.codex.protocol.appserver.ThreadResumeResponse;
+import org.dean.codex.protocol.appserver.ThreadSortKey;
 import org.dean.codex.protocol.appserver.ThreadStartParams;
 import org.dean.codex.protocol.appserver.ThreadStartResponse;
 import org.dean.codex.protocol.appserver.ThreadStartedNotification;
+import org.dean.codex.protocol.appserver.ThreadSourceKind;
+import org.dean.codex.protocol.appserver.ThreadUnarchiveParams;
+import org.dean.codex.protocol.appserver.ThreadUnarchiveResponse;
 import org.dean.codex.protocol.appserver.TurnCompletedNotification;
 import org.dean.codex.protocol.appserver.TurnInterruptParams;
 import org.dean.codex.protocol.appserver.TurnInterruptResponse;
@@ -102,7 +115,7 @@ public class InProcessCodexAppServer implements CodexAppServer {
         public ThreadStartResponse threadStart(ThreadStartParams params) {
             ensureReady();
             ThreadSummary thread = runtimeGateway.threadStart(params == null ? "" : params.title());
-            ensureRuntimeSubscription(thread.threadId());
+            ensureRuntimeSubscriptions(List.of(thread.threadId()));
             publish(new ThreadStartedNotification(thread));
             return new ThreadStartResponse(thread);
         }
@@ -111,14 +124,26 @@ public class InProcessCodexAppServer implements CodexAppServer {
         public ThreadResumeResponse threadResume(ThreadResumeParams params) {
             ensureReady();
             ThreadSummary thread = runtimeGateway.threadResume(requireThreadId(params));
-            ensureRuntimeSubscription(thread.threadId());
+            ensureRuntimeSubscriptions(loadedRelatedThreadIds(thread.threadId()));
             return new ThreadResumeResponse(thread);
         }
 
         @Override
-        public ThreadListResponse threadList() {
+        public ThreadListResponse threadList(ThreadListParams params) {
             ensureReady();
-            return new ThreadListResponse(runtimeGateway.listThreads());
+            return paginateThreads(filterThreads(runtimeGateway.listThreads(), params), params);
+        }
+
+        @Override
+        public ThreadLoadedListResponse threadLoadedList(ThreadLoadedListParams params) {
+            ensureReady();
+            List<ThreadId> loadedThreadIds = runtimeGateway.loadedThreads();
+            int offset = decodeCursor(params == null ? null : params.cursor());
+            int limit = normalizeLimit(params == null ? null : params.limit(), loadedThreadIds.size());
+            int endExclusive = Math.min(offset + limit, loadedThreadIds.size());
+            List<ThreadId> page = loadedThreadIds.subList(Math.min(offset, loadedThreadIds.size()), endExclusive);
+            String nextCursor = endExclusive < loadedThreadIds.size() ? Integer.toString(endExclusive) : null;
+            return new ThreadLoadedListResponse(page, nextCursor);
         }
 
         @Override
@@ -129,11 +154,56 @@ public class InProcessCodexAppServer implements CodexAppServer {
                     .filter(summary -> summary.threadId().equals(threadId))
                     .findFirst()
                     .orElseThrow(() -> new IllegalArgumentException("Unknown thread id: " + threadId.value()));
+            List<ThreadSummary> threadTree = runtimeGateway.relatedThreads(threadId);
+            ensureRuntimeSubscriptions(threadTree.stream()
+                    .filter(ThreadSummary::loaded)
+                    .map(ThreadSummary::threadId)
+                    .toList());
+            boolean includeTurns = params != null && params.includeTurns();
             return new ThreadReadResponse(
                     thread,
-                    runtimeGateway.turns(threadId),
-                    runtimeGateway.latestThreadMemory(threadId).orElse(null),
-                    runtimeGateway.reconstructThreadContext(threadId));
+                    includeTurns ? runtimeGateway.turns(threadId) : List.of(),
+                    includeTurns ? runtimeGateway.latestThreadMemory(threadId).orElse(null) : null,
+                    includeTurns ? runtimeGateway.reconstructThreadContext(threadId) : null,
+                    runtimeGateway.threadTreeRoot(threadId),
+                    threadTree.stream()
+                            .filter(summary -> !summary.threadId().equals(threadId))
+                            .toList());
+        }
+
+        @Override
+        public ThreadForkResponse threadFork(ThreadForkParams params) {
+            ensureReady();
+            if (params == null || params.threadId() == null) {
+                throw new IllegalArgumentException("threadId is required");
+            }
+            ThreadSummary thread = runtimeGateway.threadFork(params);
+            ensureRuntimeSubscriptions(List.of(thread.threadId()));
+            publish(new ThreadStartedNotification(thread));
+            return new ThreadForkResponse(thread);
+        }
+
+        @Override
+        public ThreadArchiveResponse threadArchive(ThreadArchiveParams params) {
+            ensureReady();
+            return new ThreadArchiveResponse(runtimeGateway.threadArchive(requireThreadId(params)));
+        }
+
+        @Override
+        public ThreadUnarchiveResponse threadUnarchive(ThreadUnarchiveParams params) {
+            ensureReady();
+            return new ThreadUnarchiveResponse(runtimeGateway.threadUnarchive(requireThreadId(params)));
+        }
+
+        @Override
+        public ThreadRollbackResponse threadRollback(ThreadRollbackParams params) {
+            ensureReady();
+            ThreadId threadId = requireThreadId(params);
+            if (params.numTurns() < 1) {
+                throw new IllegalArgumentException("numTurns must be >= 1");
+            }
+            ThreadSummary thread = runtimeGateway.threadRollback(threadId, params.numTurns());
+            return new ThreadRollbackResponse(thread, runtimeGateway.turns(threadId));
         }
 
         @Override
@@ -169,7 +239,7 @@ public class InProcessCodexAppServer implements CodexAppServer {
         public TurnStartResponse turnStart(TurnStartParams params) {
             ensureReady();
             ThreadId threadId = requireThreadId(params);
-            ensureRuntimeSubscription(threadId);
+            ensureRuntimeSubscriptions(List.of(threadId));
             return new TurnStartResponse(runtimeGateway.turnStart(threadId, params.input()));
         }
 
@@ -177,7 +247,7 @@ public class InProcessCodexAppServer implements CodexAppServer {
         public TurnResumeResponse turnResume(TurnResumeParams params) {
             ensureReady();
             ThreadId threadId = requireThreadId(params);
-            ensureRuntimeSubscription(threadId);
+            ensureRuntimeSubscriptions(List.of(threadId));
             return new TurnResumeResponse(runtimeGateway.turnResume(threadId, params.turnId()));
         }
 
@@ -223,15 +293,30 @@ public class InProcessCodexAppServer implements CodexAppServer {
             }
         }
 
-        private void ensureRuntimeSubscription(ThreadId threadId) {
-            runtimeSubscriptions.computeIfAbsent(threadId, ignored -> {
-                try {
-                    return runtimeGateway.subscribe(threadId, this::publishRuntimeNotification);
+        private void ensureRuntimeSubscriptions(List<ThreadId> threadIds) {
+            if (threadIds == null || threadIds.isEmpty()) {
+                return;
+            }
+            for (ThreadId threadId : threadIds) {
+                if (threadId == null) {
+                    continue;
                 }
-                catch (Exception exception) {
-                    throw new IllegalStateException("Unable to subscribe to runtime notifications for thread " + threadId.value(), exception);
-                }
-            });
+                runtimeSubscriptions.computeIfAbsent(threadId, ignored -> {
+                    try {
+                        return runtimeGateway.subscribe(threadId, this::publishRuntimeNotification);
+                    }
+                    catch (Exception exception) {
+                        throw new IllegalStateException("Unable to subscribe to runtime notifications for thread " + threadId.value(), exception);
+                    }
+                });
+            }
+        }
+
+        private List<ThreadId> loadedRelatedThreadIds(ThreadId threadId) {
+            return runtimeGateway.relatedThreads(threadId).stream()
+                    .filter(ThreadSummary::loaded)
+                    .map(ThreadSummary::threadId)
+                    .toList();
         }
 
         private void publishRuntimeNotification(RuntimeNotification notification) {
@@ -269,6 +354,78 @@ public class InProcessCodexAppServer implements CodexAppServer {
             }
             return params.clientInfo().name().trim();
         }
+
+        private ThreadListResponse paginateThreads(List<ThreadSummary> threads, ThreadListParams params) {
+            int offset = decodeCursor(params == null ? null : params.cursor());
+            int limit = normalizeLimit(params == null ? null : params.limit(), threads.size());
+            int start = Math.min(offset, threads.size());
+            int endExclusive = Math.min(start + limit, threads.size());
+            List<ThreadSummary> page = threads.subList(start, endExclusive);
+            String nextCursor = endExclusive < threads.size() ? Integer.toString(endExclusive) : null;
+            return new ThreadListResponse(page, nextCursor);
+        }
+
+        private List<ThreadSummary> filterThreads(List<ThreadSummary> threads, ThreadListParams params) {
+            java.util.stream.Stream<ThreadSummary> stream = threads.stream();
+            if (params != null && params.modelProviders() != null && !params.modelProviders().isEmpty()) {
+                Set<String> providers = Set.copyOf(params.modelProviders());
+                stream = stream.filter(thread -> thread.modelProvider() != null && providers.contains(thread.modelProvider()));
+            }
+            if (params != null && params.sourceKinds() != null && !params.sourceKinds().isEmpty()) {
+                Set<ThreadSourceKind> sourceKinds = Set.copyOf(params.sourceKinds());
+                stream = stream.filter(thread -> sourceKinds.contains(toSourceKind(thread)));
+            }
+            boolean explicitArchivedFilter = params != null && params.archived() != null;
+            boolean archivedOnly = explicitArchivedFilter && params.archived();
+            stream = stream.filter(thread -> explicitArchivedFilter ? archivedOnly == thread.archived() : !thread.archived());
+            if (params != null && params.cwd() != null && !params.cwd().isBlank()) {
+                stream = stream.filter(thread -> params.cwd().equals(thread.cwd()));
+            }
+            if (params != null && params.searchTerm() != null && !params.searchTerm().isBlank()) {
+                String needle = params.searchTerm().toLowerCase();
+                stream = stream.filter(thread -> {
+                    String title = thread.title() == null ? "" : thread.title().toLowerCase();
+                    String preview = thread.preview() == null ? "" : thread.preview().toLowerCase();
+                    return title.contains(needle) || preview.contains(needle);
+                });
+            }
+            java.util.Comparator<ThreadSummary> comparator = ((params == null ? null : params.sortKey()) == ThreadSortKey.CREATED_AT)
+                    ? java.util.Comparator.comparing(ThreadSummary::createdAt).reversed()
+                    : java.util.Comparator.comparing(ThreadSummary::updatedAt).reversed();
+            return stream.sorted(comparator).toList();
+        }
+
+        private ThreadSourceKind toSourceKind(ThreadSummary thread) {
+            return switch (thread.source()) {
+                case CLI -> ThreadSourceKind.CLI;
+                case APP_SERVER -> ThreadSourceKind.APP_SERVER;
+                case EXEC -> ThreadSourceKind.EXEC;
+                case SUB_AGENT -> ThreadSourceKind.SUB_AGENT;
+                case UNKNOWN -> ThreadSourceKind.UNKNOWN;
+            };
+        }
+
+        private int decodeCursor(String cursor) {
+            if (cursor == null || cursor.isBlank()) {
+                return 0;
+            }
+            try {
+                return Math.max(0, Integer.parseInt(cursor.trim()));
+            }
+            catch (NumberFormatException exception) {
+                throw new IllegalArgumentException("Invalid cursor: " + cursor);
+            }
+        }
+
+        private int normalizeLimit(Integer limit, int defaultValue) {
+            if (limit == null) {
+                return Math.max(0, defaultValue);
+            }
+            if (limit < 0) {
+                throw new IllegalArgumentException("limit must be >= 0");
+            }
+            return limit;
+        }
     }
 
     private ThreadId requireThreadId(ThreadResumeParams params) {
@@ -286,6 +443,27 @@ public class InProcessCodexAppServer implements CodexAppServer {
     }
 
     private ThreadId requireThreadId(ThreadCompactStartParams params) {
+        if (params == null || params.threadId() == null) {
+            throw new IllegalArgumentException("threadId is required");
+        }
+        return params.threadId();
+    }
+
+    private ThreadId requireThreadId(ThreadArchiveParams params) {
+        if (params == null || params.threadId() == null) {
+            throw new IllegalArgumentException("threadId is required");
+        }
+        return params.threadId();
+    }
+
+    private ThreadId requireThreadId(ThreadUnarchiveParams params) {
+        if (params == null || params.threadId() == null) {
+            throw new IllegalArgumentException("threadId is required");
+        }
+        return params.threadId();
+    }
+
+    private ThreadId requireThreadId(ThreadRollbackParams params) {
         if (params == null || params.threadId() == null) {
             throw new IllegalArgumentException("threadId is required");
         }

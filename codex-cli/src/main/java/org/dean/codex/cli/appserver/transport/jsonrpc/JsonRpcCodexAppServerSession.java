@@ -10,18 +10,29 @@ import org.dean.codex.protocol.appserver.InitializeResponse;
 import org.dean.codex.protocol.appserver.InitializedNotification;
 import org.dean.codex.protocol.appserver.SkillsListParams;
 import org.dean.codex.protocol.appserver.SkillsListResponse;
+import org.dean.codex.protocol.appserver.ThreadArchiveParams;
+import org.dean.codex.protocol.appserver.ThreadArchiveResponse;
 import org.dean.codex.protocol.appserver.ThreadCompactionStartedNotification;
 import org.dean.codex.protocol.appserver.ThreadCompactStartParams;
 import org.dean.codex.protocol.appserver.ThreadCompactStartResponse;
 import org.dean.codex.protocol.appserver.ThreadCompactedNotification;
+import org.dean.codex.protocol.appserver.ThreadForkParams;
+import org.dean.codex.protocol.appserver.ThreadForkResponse;
+import org.dean.codex.protocol.appserver.ThreadListParams;
 import org.dean.codex.protocol.appserver.ThreadListResponse;
+import org.dean.codex.protocol.appserver.ThreadLoadedListParams;
+import org.dean.codex.protocol.appserver.ThreadLoadedListResponse;
 import org.dean.codex.protocol.appserver.ThreadReadParams;
 import org.dean.codex.protocol.appserver.ThreadReadResponse;
+import org.dean.codex.protocol.appserver.ThreadRollbackParams;
+import org.dean.codex.protocol.appserver.ThreadRollbackResponse;
 import org.dean.codex.protocol.appserver.ThreadResumeParams;
 import org.dean.codex.protocol.appserver.ThreadResumeResponse;
 import org.dean.codex.protocol.appserver.ThreadStartParams;
 import org.dean.codex.protocol.appserver.ThreadStartResponse;
 import org.dean.codex.protocol.appserver.ThreadStartedNotification;
+import org.dean.codex.protocol.appserver.ThreadUnarchiveParams;
+import org.dean.codex.protocol.appserver.ThreadUnarchiveResponse;
 import org.dean.codex.protocol.appserver.TurnCompletedNotification;
 import org.dean.codex.protocol.appserver.TurnInterruptParams;
 import org.dean.codex.protocol.appserver.TurnInterruptResponse;
@@ -134,13 +145,38 @@ public class JsonRpcCodexAppServerSession implements CodexAppServerSession {
     }
 
     @Override
-    public ThreadListResponse threadList() {
-        return request("thread/list", null, ThreadListResponse.class);
+    public ThreadListResponse threadList(ThreadListParams params) {
+        return request("thread/list", params, ThreadListResponse.class);
+    }
+
+    @Override
+    public ThreadLoadedListResponse threadLoadedList(ThreadLoadedListParams params) {
+        return request("thread/loaded/list", params, ThreadLoadedListResponse.class);
     }
 
     @Override
     public ThreadReadResponse threadRead(ThreadReadParams params) {
         return request("thread/read", params, ThreadReadResponse.class);
+    }
+
+    @Override
+    public ThreadForkResponse threadFork(ThreadForkParams params) {
+        return request("thread/fork", params, ThreadForkResponse.class);
+    }
+
+    @Override
+    public ThreadArchiveResponse threadArchive(ThreadArchiveParams params) {
+        return request("thread/archive", params, ThreadArchiveResponse.class);
+    }
+
+    @Override
+    public ThreadUnarchiveResponse threadUnarchive(ThreadUnarchiveParams params) {
+        return request("thread/unarchive", params, ThreadUnarchiveResponse.class);
+    }
+
+    @Override
+    public ThreadRollbackResponse threadRollback(ThreadRollbackParams params) {
+        return request("thread/rollback", params, ThreadRollbackResponse.class);
     }
 
     @Override

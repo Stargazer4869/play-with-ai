@@ -14,12 +14,21 @@ import org.dean.codex.protocol.appserver.AppServerClientInfo;
 import org.dean.codex.protocol.appserver.AppServerNotification;
 import org.dean.codex.protocol.appserver.InitializeParams;
 import org.dean.codex.protocol.appserver.InitializedNotification;
+import org.dean.codex.protocol.appserver.ThreadArchiveParams;
+import org.dean.codex.protocol.appserver.ThreadForkParams;
+import org.dean.codex.protocol.appserver.ThreadListParams;
+import org.dean.codex.protocol.appserver.ThreadLoadedListParams;
+import org.dean.codex.protocol.appserver.ThreadReadParams;
+import org.dean.codex.protocol.appserver.ThreadRollbackParams;
+import org.dean.codex.protocol.appserver.ThreadResumeParams;
 import org.dean.codex.protocol.appserver.ThreadStartedNotification;
 import org.dean.codex.protocol.appserver.ThreadStartParams;
+import org.dean.codex.protocol.appserver.ThreadUnarchiveParams;
 import org.dean.codex.protocol.appserver.TurnCompletedNotification;
 import org.dean.codex.protocol.appserver.TurnStartParams;
 import org.dean.codex.protocol.appserver.TurnStartedNotification;
 import org.dean.codex.protocol.conversation.ThreadId;
+import org.dean.codex.protocol.conversation.ThreadSource;
 import org.dean.codex.protocol.conversation.TurnId;
 import org.dean.codex.protocol.conversation.TurnStatus;
 import org.dean.codex.protocol.context.ReconstructedThreadContext;
@@ -46,6 +55,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -109,6 +119,263 @@ class JsonRpcCodexAppServerSessionTest {
         assertNull(hostFailure.get(), "Host failed: " + hostFailure.get());
     }
 
+    @Test
+    void sessionSupportsThreadListReadAndLoadedListAcrossStdioTransport() throws Exception {
+        CodexAppServer appServer = appServer();
+        PipedOutputStream clientToServer = new PipedOutputStream();
+        PipedInputStream serverInput = new PipedInputStream(clientToServer);
+        PipedOutputStream serverToClient = new PipedOutputStream();
+        PipedInputStream clientInput = new PipedInputStream(serverToClient);
+        AtomicReference<Throwable> hostFailure = new AtomicReference<>();
+
+        Thread hostThread = new Thread(() -> {
+            try {
+                new StdioJsonRpcAppServerHost(
+                        new JsonRpcAppServerDispatcher(appServer),
+                        serverInput,
+                        serverToClient).run();
+            }
+            catch (Throwable throwable) {
+                hostFailure.set(throwable);
+            }
+        }, "test-jsonrpc-appserver-host-read");
+        hostThread.setDaemon(true);
+        hostThread.start();
+
+        try (JsonRpcCodexAppServerSession session = new JsonRpcCodexAppServerSession(
+                clientInput,
+                clientToServer,
+                () -> {
+                    clientToServer.close();
+                    hostThread.join(1_000);
+                    clientInput.close();
+                },
+                Duration.ofSeconds(3))) {
+            session.initialize(new InitializeParams(
+                    new AppServerClientInfo("transport-client", "Transport Client", "1.0.0"),
+                    new AppServerCapabilities(false, List.of())));
+            session.initialized(new InitializedNotification());
+
+            ThreadId threadId = session.threadStart(new ThreadStartParams("Transport thread")).thread().threadId();
+            session.turnStart(new TurnStartParams(threadId, "Inspect repo"));
+
+            var filtered = session.threadList(new ThreadListParams(null, null, null, null, null, Boolean.FALSE, null, "inspect"));
+            assertEquals(1, filtered.threads().size());
+            assertEquals(threadId, filtered.threads().get(0).threadId());
+            assertNull(filtered.nextCursor());
+
+            var metadataOnly = session.threadRead(new ThreadReadParams(threadId, false));
+            assertTrue(metadataOnly.turns().isEmpty());
+            assertNull(metadataOnly.threadMemory());
+            assertNull(metadataOnly.reconstructedContext());
+            assertEquals(threadId, metadataOnly.treeRootThreadId());
+            assertTrue(metadataOnly.relatedThreads().isEmpty());
+
+            var withTurns = session.threadRead(new ThreadReadParams(threadId, true));
+            assertEquals(1, withTurns.turns().size());
+            assertNotNull(withTurns.reconstructedContext());
+            assertEquals(threadId, withTurns.treeRootThreadId());
+            assertTrue(withTurns.relatedThreads().isEmpty());
+
+            var loaded = session.threadLoadedList(new ThreadLoadedListParams());
+            assertTrue(loaded.data().contains(threadId));
+        }
+
+        hostThread.join(1_000);
+        assertNull(hostFailure.get(), "Host failed: " + hostFailure.get());
+    }
+
+    @Test
+    void sessionThreadReadDoesNotLoadPersistedThreadButResumeDoes() throws Exception {
+        ConversationStore store = new InMemoryConversationStore();
+        ThreadId threadId = store.createThread("Persisted thread");
+        CodexAppServer appServer = appServer(store);
+        PipedOutputStream clientToServer = new PipedOutputStream();
+        PipedInputStream serverInput = new PipedInputStream(clientToServer);
+        PipedOutputStream serverToClient = new PipedOutputStream();
+        PipedInputStream clientInput = new PipedInputStream(serverToClient);
+        AtomicReference<Throwable> hostFailure = new AtomicReference<>();
+
+        Thread hostThread = new Thread(() -> {
+            try {
+                new StdioJsonRpcAppServerHost(
+                        new JsonRpcAppServerDispatcher(appServer),
+                        serverInput,
+                        serverToClient).run();
+            }
+            catch (Throwable throwable) {
+                hostFailure.set(throwable);
+            }
+        }, "test-jsonrpc-appserver-host-resume");
+        hostThread.setDaemon(true);
+        hostThread.start();
+
+        try (JsonRpcCodexAppServerSession session = new JsonRpcCodexAppServerSession(
+                clientInput,
+                clientToServer,
+                () -> {
+                    clientToServer.close();
+                    hostThread.join(1_000);
+                    clientInput.close();
+                },
+                Duration.ofSeconds(3))) {
+            session.initialize(new InitializeParams(
+                    new AppServerClientInfo("transport-client", "Transport Client", "1.0.0"),
+                    new AppServerCapabilities(false, List.of())));
+            session.initialized(new InitializedNotification());
+
+            var metadataOnly = session.threadRead(new ThreadReadParams(threadId, false));
+            assertEquals(threadId, metadataOnly.thread().threadId());
+            assertNull(metadataOnly.threadMemory());
+            assertNull(metadataOnly.reconstructedContext());
+
+            var loadedBeforeResume = session.threadLoadedList(new ThreadLoadedListParams());
+            assertTrue(loadedBeforeResume.data().stream().noneMatch(threadId::equals));
+
+            var resumed = session.threadResume(new ThreadResumeParams(threadId));
+            assertEquals(threadId, resumed.thread().threadId());
+
+            var loadedAfterResume = session.threadLoadedList(new ThreadLoadedListParams());
+            assertTrue(loadedAfterResume.data().contains(threadId));
+        }
+
+        hostThread.join(1_000);
+        assertNull(hostFailure.get(), "Host failed: " + hostFailure.get());
+    }
+
+    @Test
+    void sessionThreadForkCopiesParentHistoryAndDiverges() throws Exception {
+        CodexAppServer appServer = appServer();
+        PipedOutputStream clientToServer = new PipedOutputStream();
+        PipedInputStream serverInput = new PipedInputStream(clientToServer);
+        PipedOutputStream serverToClient = new PipedOutputStream();
+        PipedInputStream clientInput = new PipedInputStream(serverToClient);
+        AtomicReference<Throwable> hostFailure = new AtomicReference<>();
+
+        Thread hostThread = new Thread(() -> {
+            try {
+                new StdioJsonRpcAppServerHost(
+                        new JsonRpcAppServerDispatcher(appServer),
+                        serverInput,
+                        serverToClient).run();
+            }
+            catch (Throwable throwable) {
+                hostFailure.set(throwable);
+            }
+        }, "test-jsonrpc-appserver-host-fork");
+        hostThread.setDaemon(true);
+        hostThread.start();
+
+        try (JsonRpcCodexAppServerSession session = new JsonRpcCodexAppServerSession(
+                clientInput,
+                clientToServer,
+                () -> {
+                    clientToServer.close();
+                    hostThread.join(1_000);
+                    clientInput.close();
+                },
+                Duration.ofSeconds(3))) {
+            session.initialize(new InitializeParams(
+                    new AppServerClientInfo("transport-client", "Transport Client", "1.0.0"),
+                    new AppServerCapabilities(false, List.of())));
+            session.initialized(new InitializedNotification());
+
+            ThreadId parentThreadId = session.threadStart(new ThreadStartParams("Parent thread")).thread().threadId();
+            session.turnStart(new TurnStartParams(parentThreadId, "Inspect repo"));
+
+            var forked = session.threadFork(new ThreadForkParams(
+                    parentThreadId,
+                    "Forked thread",
+                    Boolean.TRUE,
+                    "/workspace/forked",
+                    "openai",
+                    "gpt-5.4",
+                    ThreadSource.APP_SERVER,
+                    "worker-1",
+                    "worker",
+                    "root/worker-1")).thread();
+
+            assertEquals("Forked thread", forked.title());
+            assertEquals("/workspace/forked", forked.cwd());
+            assertTrue(forked.ephemeral());
+
+            var forkedRead = session.threadRead(new ThreadReadParams(forked.threadId(), true));
+            assertEquals(1, forkedRead.turns().size());
+
+            session.turnStart(new TurnStartParams(forked.threadId(), "Write follow-up"));
+
+            assertEquals(1, session.threadRead(new ThreadReadParams(parentThreadId, true)).turns().size());
+            assertEquals(2, session.threadRead(new ThreadReadParams(forked.threadId(), true)).turns().size());
+        }
+
+        hostThread.join(1_000);
+        assertNull(hostFailure.get(), "Host failed: " + hostFailure.get());
+    }
+
+    @Test
+    void sessionSupportsThreadArchiveUnarchiveAndRollbackAcrossStdioTransport() throws Exception {
+        CodexAppServer appServer = appServer();
+        PipedOutputStream clientToServer = new PipedOutputStream();
+        PipedInputStream serverInput = new PipedInputStream(clientToServer);
+        PipedOutputStream serverToClient = new PipedOutputStream();
+        PipedInputStream clientInput = new PipedInputStream(serverToClient);
+        AtomicReference<Throwable> hostFailure = new AtomicReference<>();
+
+        Thread hostThread = new Thread(() -> {
+            try {
+                new StdioJsonRpcAppServerHost(
+                        new JsonRpcAppServerDispatcher(appServer),
+                        serverInput,
+                        serverToClient).run();
+            }
+            catch (Throwable throwable) {
+                hostFailure.set(throwable);
+            }
+        }, "test-jsonrpc-appserver-host-archive-rollback");
+        hostThread.setDaemon(true);
+        hostThread.start();
+
+        try (JsonRpcCodexAppServerSession session = new JsonRpcCodexAppServerSession(
+                clientInput,
+                clientToServer,
+                () -> {
+                    clientToServer.close();
+                    hostThread.join(1_000);
+                    clientInput.close();
+                },
+                Duration.ofSeconds(3))) {
+            session.initialize(new InitializeParams(
+                    new AppServerClientInfo("transport-client", "Transport Client", "1.0.0"),
+                    new AppServerCapabilities(false, List.of())));
+            session.initialized(new InitializedNotification());
+
+            ThreadId threadId = session.threadStart(new ThreadStartParams("Lifecycle thread")).thread().threadId();
+            session.turnStart(new TurnStartParams(threadId, "Inspect repo"));
+            session.turnStart(new TurnStartParams(threadId, "Run tests"));
+
+            var archived = session.threadArchive(new ThreadArchiveParams(threadId)).thread();
+            assertTrue(archived.archived());
+            assertFalse(session.threadLoadedList(new ThreadLoadedListParams()).data().contains(threadId));
+            assertTrue(session.threadList(new ThreadListParams(null, null, null, null, null, null, null, null)).threads().isEmpty());
+            assertEquals(List.of(threadId),
+                    session.threadList(new ThreadListParams(null, null, null, null, null, Boolean.TRUE, null, null)).threads()
+                            .stream()
+                            .map(thread -> thread.threadId())
+                            .toList());
+
+            var unarchived = session.threadUnarchive(new ThreadUnarchiveParams(threadId)).thread();
+            assertFalse(unarchived.archived());
+
+            var rollback = session.threadRollback(new ThreadRollbackParams(threadId, 1));
+            assertEquals(1, rollback.thread().turnCount());
+            assertEquals(1, rollback.turns().size());
+            assertEquals("Inspect repo", rollback.turns().get(0).userInput());
+        }
+
+        hostThread.join(1_000);
+        assertNull(hostFailure.get(), "Host failed: " + hostFailure.get());
+    }
+
     private List<AppServerNotification> awaitNotifications(BlockingQueue<AppServerNotification> notifications) throws InterruptedException {
         java.util.ArrayList<AppServerNotification> observed = new java.util.ArrayList<>();
         long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
@@ -126,7 +393,10 @@ class JsonRpcCodexAppServerSessionTest {
     }
 
     private CodexAppServer appServer() {
-        ConversationStore store = new InMemoryConversationStore();
+        return appServer(new InMemoryConversationStore());
+    }
+
+    private CodexAppServer appServer(ConversationStore store) {
         SkillService skillService = new SkillService() {
             @Override
             public List<SkillMetadata> listSkills(boolean forceReload) {

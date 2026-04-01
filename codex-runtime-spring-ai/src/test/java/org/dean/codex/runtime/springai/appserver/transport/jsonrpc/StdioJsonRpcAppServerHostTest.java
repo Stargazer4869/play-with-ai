@@ -12,16 +12,27 @@ import org.dean.codex.protocol.appserver.InitializeResponse;
 import org.dean.codex.protocol.appserver.InitializedNotification;
 import org.dean.codex.protocol.appserver.SkillsListParams;
 import org.dean.codex.protocol.appserver.SkillsListResponse;
+import org.dean.codex.protocol.appserver.ThreadArchiveParams;
+import org.dean.codex.protocol.appserver.ThreadArchiveResponse;
 import org.dean.codex.protocol.appserver.ThreadCompactStartParams;
 import org.dean.codex.protocol.appserver.ThreadCompactStartResponse;
+import org.dean.codex.protocol.appserver.ThreadForkParams;
+import org.dean.codex.protocol.appserver.ThreadForkResponse;
+import org.dean.codex.protocol.appserver.ThreadListParams;
 import org.dean.codex.protocol.appserver.ThreadListResponse;
+import org.dean.codex.protocol.appserver.ThreadLoadedListParams;
+import org.dean.codex.protocol.appserver.ThreadLoadedListResponse;
 import org.dean.codex.protocol.appserver.ThreadReadParams;
 import org.dean.codex.protocol.appserver.ThreadReadResponse;
+import org.dean.codex.protocol.appserver.ThreadRollbackParams;
+import org.dean.codex.protocol.appserver.ThreadRollbackResponse;
 import org.dean.codex.protocol.appserver.ThreadResumeParams;
 import org.dean.codex.protocol.appserver.ThreadResumeResponse;
 import org.dean.codex.protocol.appserver.ThreadStartParams;
 import org.dean.codex.protocol.appserver.ThreadStartResponse;
 import org.dean.codex.protocol.appserver.ThreadStartedNotification;
+import org.dean.codex.protocol.appserver.ThreadUnarchiveParams;
+import org.dean.codex.protocol.appserver.ThreadUnarchiveResponse;
 import org.dean.codex.protocol.appserver.TurnInterruptParams;
 import org.dean.codex.protocol.appserver.TurnInterruptResponse;
 import org.dean.codex.protocol.appserver.TurnResumeParams;
@@ -167,15 +178,45 @@ class StdioJsonRpcAppServerHostTest {
         }
 
         @Override
-        public ThreadListResponse threadList() {
+        public ThreadListResponse threadList(ThreadListParams params) {
             ensureReady();
             return new ThreadListResponse(List.of());
+        }
+
+        @Override
+        public ThreadLoadedListResponse threadLoadedList(ThreadLoadedListParams params) {
+            ensureReady();
+            return new ThreadLoadedListResponse(List.of(), null);
         }
 
         @Override
         public ThreadReadResponse threadRead(ThreadReadParams params) {
             ensureReady();
             return new ThreadReadResponse(new ThreadSummary(params.threadId(), "Demo thread", Instant.now(), Instant.now(), 0), List.of(), null, null);
+        }
+
+        @Override
+        public ThreadForkResponse threadFork(ThreadForkParams params) {
+            ensureReady();
+            throw new UnsupportedOperationException("Not used in this test");
+        }
+
+        @Override
+        public ThreadArchiveResponse threadArchive(ThreadArchiveParams params) {
+            ensureReady();
+            throw new UnsupportedOperationException("Not used in this test");
+        }
+
+        @Override
+        public ThreadUnarchiveResponse threadUnarchive(ThreadUnarchiveParams params) {
+            ensureReady();
+            throw new UnsupportedOperationException("Not used in this test");
+        }
+
+        @Override
+        public ThreadRollbackResponse threadRollback(ThreadRollbackParams params) {
+            ensureReady();
+            throw new UnsupportedOperationException("Not used in this test");
         }
 
         @Override

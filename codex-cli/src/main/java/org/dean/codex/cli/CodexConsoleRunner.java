@@ -10,14 +10,21 @@ import org.dean.codex.protocol.appserver.AppServerNotification;
 import org.dean.codex.protocol.appserver.InitializeParams;
 import org.dean.codex.protocol.appserver.InitializedNotification;
 import org.dean.codex.protocol.appserver.SkillsListParams;
+import org.dean.codex.protocol.appserver.ThreadArchiveParams;
 import org.dean.codex.protocol.appserver.ThreadCompaction;
 import org.dean.codex.protocol.appserver.ThreadCompactStartParams;
 import org.dean.codex.protocol.appserver.ThreadCompactionStartedNotification;
 import org.dean.codex.protocol.appserver.ThreadCompactedNotification;
+import org.dean.codex.protocol.appserver.ThreadForkParams;
+import org.dean.codex.protocol.appserver.ThreadListParams;
+import org.dean.codex.protocol.appserver.ThreadListResponse;
+import org.dean.codex.protocol.appserver.ThreadLoadedListParams;
 import org.dean.codex.protocol.appserver.ThreadReadParams;
 import org.dean.codex.protocol.appserver.ThreadReadResponse;
+import org.dean.codex.protocol.appserver.ThreadRollbackParams;
 import org.dean.codex.protocol.appserver.ThreadResumeParams;
 import org.dean.codex.protocol.appserver.ThreadStartParams;
+import org.dean.codex.protocol.appserver.ThreadUnarchiveParams;
 import org.dean.codex.protocol.context.ThreadMemory;
 import org.dean.codex.protocol.appserver.TurnCompletedNotification;
 import org.dean.codex.protocol.appserver.TurnInterruptParams;
@@ -30,7 +37,9 @@ import org.dean.codex.protocol.appserver.TurnSteerResponse;
 import org.dean.codex.protocol.approval.ApprovalStatus;
 import org.dean.codex.protocol.approval.CommandApprovalRequest;
 import org.dean.codex.protocol.conversation.ConversationTurn;
+import org.dean.codex.protocol.conversation.ThreadActiveFlag;
 import org.dean.codex.protocol.conversation.ThreadId;
+import org.dean.codex.protocol.conversation.ThreadSource;
 import org.dean.codex.protocol.conversation.ThreadSummary;
 import org.dean.codex.protocol.conversation.TurnId;
 import org.dean.codex.protocol.event.TurnEvent;
@@ -47,18 +56,24 @@ import org.dean.codex.protocol.skill.SkillMetadata;
 import org.dean.codex.protocol.tool.ShellCommandResult;
 import org.jspecify.annotations.NonNull;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.CommandLineRunner;
 import org.springframework.stereotype.Component;
 
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Scanner;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
 @Component
+@ConditionalOnProperty(name = "codex.cli.enabled", havingValue = "true", matchIfMissing = true)
 public class CodexConsoleRunner implements CommandLineRunner {
 
     private static final DateTimeFormatter TIMESTAMP_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
@@ -123,32 +138,51 @@ public class CodexConsoleRunner implements CommandLineRunner {
             System.out.println("Started new thread: " + shortThreadId(activeThreadId));
             return true;
         }
-        if (input.equalsIgnoreCase(":threads")) {
-            printThreads();
+        if (isCommand(input, ":threads")) {
+            String requestedMode = commandArguments(input, ":threads");
+            printThreads(requestedMode);
             return true;
         }
         if (input.equalsIgnoreCase(":skills")) {
             printSkills();
             return true;
         }
-        if (input.equalsIgnoreCase(":approvals")) {
-            printApprovals();
+        if (isCommand(input, ":resume") || isCommand(input, ":use")) {
+            String command = isCommand(input, ":resume") ? ":resume" : ":use";
+            String requestedThread = commandArguments(input, command);
+            if (requestedThread.isEmpty()) {
+                System.out.printf("Usage: %s <thread-id-prefix>%n", command);
+                return true;
+            }
+            switchActiveThread(requestedThread);
             return true;
         }
-        if (input.startsWith(":use")) {
-            String requestedThread = input.substring(4).trim();
-            if (requestedThread.isEmpty()) {
-                System.out.println("Usage: :use <thread-id-prefix>");
-                return true;
-            }
-            ThreadId resolved = resolveThread(requestedThread);
-            if (resolved == null) {
-                System.out.println("No thread matched: " + requestedThread);
-                return true;
-            }
-            appServerSession.threadResume(new ThreadResumeParams(resolved));
-            activeThreadId = resolved;
-            System.out.println("Switched to thread: " + shortThreadId(activeThreadId));
+        if (isCommand(input, ":fork")) {
+            handleForkCommand(commandArguments(input, ":fork"));
+            return true;
+        }
+        if (isCommand(input, ":archive")) {
+            handleArchiveCommand(commandArguments(input, ":archive"));
+            return true;
+        }
+        if (isCommand(input, ":unarchive")) {
+            handleUnarchiveCommand(commandArguments(input, ":unarchive"));
+            return true;
+        }
+        if (isCommand(input, ":rollback")) {
+            handleRollbackCommand(commandArguments(input, ":rollback"));
+            return true;
+        }
+        if (isCommand(input, ":subagents")) {
+            printSubagents(commandArguments(input, ":subagents"));
+            return true;
+        }
+        if (isCommand(input, ":agent")) {
+            handleAgentCommand(commandArguments(input, ":agent"));
+            return true;
+        }
+        if (input.equalsIgnoreCase(":approvals")) {
+            printApprovals();
             return true;
         }
         if (input.equalsIgnoreCase(":history")) {
@@ -226,32 +260,100 @@ public class CodexConsoleRunner implements CommandLineRunner {
     }
 
     private void printHelp() {
-        System.out.println("Commands: :help, :new, :threads, :skills, :use <thread-id-prefix>, :history, :compact, :approvals, :approve <approval-id-prefix>, :reject <approval-id-prefix> [reason], :interrupt, :steer <message>, exit, quit");
+        System.out.println("Commands: :help, :new, :threads [all|loaded|archived], :resume <thread-id-prefix>, :use <thread-id-prefix>, :fork [thread-id-prefix] [title], :archive [thread-id-prefix], :unarchive <thread-id-prefix>, :rollback [thread-id-prefix] <turn-count>, :subagents [thread-id-prefix], :agent <tree|use> ..., :skills, :history, :compact, :approvals, :approve <approval-id-prefix>, :reject <approval-id-prefix> [reason], :interrupt, :steer <message>, exit, quit");
     }
 
-    private void printThreads() {
-        List<ThreadSummary> threads = appServerSession.threadList().threads();
+    private void printThreads(String requestedMode) {
+        String mode = requestedMode == null ? "" : requestedMode.trim().toLowerCase();
+        List<ThreadSummary> threads;
+        switch (mode) {
+            case "", "active" -> threads = fetchThreads(false);
+            case "all" -> threads = fetchAllThreads();
+            case "archived" -> threads = fetchThreads(true);
+            case "loaded" -> {
+                Set<String> loadedIds = fetchLoadedThreadIds().stream()
+                        .map(ThreadId::value)
+                        .collect(Collectors.toSet());
+                threads = fetchAllThreads().stream()
+                        .filter(thread -> loadedIds.contains(thread.threadId().value()))
+                        .toList();
+            }
+            default -> {
+                System.out.println("Usage: :threads [all|loaded|archived]");
+                return;
+            }
+        }
         if (threads.isEmpty()) {
-            System.out.println("No threads yet.");
+            String label = mode.isEmpty() ? "active" : mode;
+            System.out.println("No " + label + " threads.");
             return;
         }
         for (ThreadSummary thread : threads) {
-            String marker = thread.threadId().equals(activeThreadId) ? "*" : " ";
-            System.out.printf("%s %s  %s  turns=%d  updated=%s%n",
-                    marker,
-                    shortThreadId(thread.threadId()),
-                    thread.title(),
-                    thread.turnCount(),
-                    TIMESTAMP_FORMAT.format(thread.updatedAt()));
+            printThreadSummary(thread);
         }
     }
 
-    private ThreadId resolveThread(String prefix) {
-        return appServerSession.threadList().threads().stream()
-                .map(ThreadSummary::threadId)
-                .filter(threadId -> threadId.value().startsWith(prefix))
-                .findFirst()
-                .orElse(null);
+    private void printThreadSummary(ThreadSummary thread) {
+        String marker = thread.threadId().equals(activeThreadId) ? "*" : " ";
+        System.out.printf("%s %s  %s  turns=%d  updated=%s%n",
+                marker,
+                shortThreadId(thread.threadId()),
+                thread.title(),
+                thread.turnCount(),
+                formatTimestamp(thread.updatedAt()));
+
+        List<String> details = new ArrayList<>();
+        details.add("status=" + formatEnum(thread.status()));
+        details.add("source=" + formatThreadSource(thread.source()));
+        if (thread.archived()) {
+            details.add("archived");
+        }
+        if (thread.parentThreadId() != null) {
+            details.add("sub-agent");
+        }
+        if (!thread.activeFlags().isEmpty()) {
+            details.add("flags=" + thread.activeFlags().stream()
+                    .map(this::formatThreadFlag)
+                    .collect(Collectors.joining(",")));
+        }
+        if (thread.agentStatus() != null) {
+            details.add("agent=" + formatEnum(thread.agentStatus()));
+        }
+        System.out.println("  " + String.join("  ", details));
+
+        if (thread.parentThreadId() != null
+                || thread.agentNickname() != null
+                || thread.agentRole() != null
+                || thread.agentPath() != null
+                || thread.agentDepth() != null) {
+            List<String> agentDetails = new ArrayList<>();
+            if (thread.parentThreadId() != null) {
+                agentDetails.add("parent=" + shortThreadId(thread.parentThreadId()));
+            }
+            if (thread.agentNickname() != null) {
+                agentDetails.add("nickname=" + thread.agentNickname());
+            }
+            if (thread.agentRole() != null) {
+                agentDetails.add("role=" + thread.agentRole());
+            }
+            if (thread.agentDepth() != null) {
+                agentDetails.add("depth=" + thread.agentDepth());
+            }
+            if (thread.agentPath() != null) {
+                agentDetails.add("path=" + thread.agentPath());
+            }
+            if (thread.agentClosedAt() != null) {
+                agentDetails.add("closedAt=" + formatTimestamp(thread.agentClosedAt()));
+            }
+            System.out.println("  agent: " + String.join("  ", agentDetails));
+        }
+
+        if (thread.cwd() != null && !thread.cwd().isBlank()) {
+            System.out.println("  cwd: " + thread.cwd());
+        }
+        if (thread.preview() != null && !thread.preview().isBlank()) {
+            System.out.println("  preview: " + thread.preview());
+        }
     }
 
     private void printSkills() {
@@ -469,6 +571,10 @@ public class CodexConsoleRunner implements CommandLineRunner {
         return value.length() <= 8 ? value : value.substring(0, 8);
     }
 
+    private String formatTimestamp(java.time.Instant timestamp) {
+        return timestamp == null ? "(unknown)" : TIMESTAMP_FORMAT.format(timestamp);
+    }
+
     private String shortCompactionId(ThreadCompaction compaction) {
         String value = compaction.compactionId();
         return value.length() <= 8 ? value : value.substring(0, 8);
@@ -511,6 +617,369 @@ public class CodexConsoleRunner implements CommandLineRunner {
                         || turn.status() == org.dean.codex.protocol.conversation.TurnStatus.AWAITING_APPROVAL)
                 .reduce((first, second) -> second)
                 .orElse(null);
+    }
+
+    private boolean isCommand(String input, String command) {
+        return input.equalsIgnoreCase(command)
+                || (input.length() > command.length()
+                && input.regionMatches(true, 0, command, 0, command.length())
+                && Character.isWhitespace(input.charAt(command.length())));
+    }
+
+    private String commandArguments(String input, String command) {
+        if (input.length() <= command.length()) {
+            return "";
+        }
+        return input.substring(command.length()).trim();
+    }
+
+    private void switchActiveThread(String requestedThread) {
+        ThreadSummary resolved = resolveRequiredThread(requestedThread, true);
+        if (resolved == null) {
+            return;
+        }
+        if (resolved.archived()) {
+            System.out.println("Thread is archived. Unarchive it before resuming: " + shortThreadId(resolved.threadId()));
+            return;
+        }
+        appServerSession.threadResume(new ThreadResumeParams(resolved.threadId()));
+        activeThreadId = resolved.threadId();
+        System.out.println("Switched to thread: " + shortThreadId(activeThreadId));
+    }
+
+    private void handleForkCommand(String arguments) {
+        String remainder = arguments == null ? "" : arguments.trim();
+        ThreadId sourceThreadId = activeThreadId;
+        String title = null;
+        if (!remainder.isEmpty()) {
+            if (remainder.startsWith("--title ")) {
+                title = blankToNull(remainder.substring("--title ".length()).trim());
+                if (title == null) {
+                    System.out.println("Usage: :fork [thread-id-prefix] [title] or :fork --title <title>");
+                    return;
+                }
+            }
+            else {
+                String[] parts = remainder.split("\\s+", 2);
+                List<ThreadSummary> matches = findMatchingThreads(parts[0], true);
+                if (matches.size() == 1) {
+                    sourceThreadId = matches.get(0).threadId();
+                    title = parts.length > 1 ? blankToNull(parts[1]) : null;
+                }
+                else if (matches.size() > 1) {
+                    printAmbiguousThreads(parts[0], matches);
+                    return;
+                }
+                else {
+                    title = blankToNull(remainder);
+                }
+            }
+        }
+
+        ThreadSummary forked = appServerSession.threadFork(new ThreadForkParams(
+                sourceThreadId,
+                title,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null)).thread();
+        activeThreadId = forked.threadId();
+        System.out.printf("Forked thread %s from %s.%n", shortThreadId(forked.threadId()), shortThreadId(sourceThreadId));
+        System.out.println("Switched to thread: " + shortThreadId(activeThreadId));
+    }
+
+    private void handleArchiveCommand(String arguments) {
+        ThreadSummary target = arguments == null || arguments.isBlank()
+                ? findThreadById(activeThreadId)
+                : resolveRequiredThread(arguments.trim(), true);
+        if (target == null) {
+            return;
+        }
+        ThreadSummary archived = appServerSession.threadArchive(new ThreadArchiveParams(target.threadId())).thread();
+        System.out.println("Archived thread: " + shortThreadId(archived.threadId()));
+        if (archived.threadId().equals(activeThreadId)) {
+            switchAfterArchivingActiveThread(archived.threadId());
+        }
+    }
+
+    private void handleUnarchiveCommand(String arguments) {
+        String prefix = arguments == null ? "" : arguments.trim();
+        if (prefix.isEmpty()) {
+            System.out.println("Usage: :unarchive <thread-id-prefix>");
+            return;
+        }
+        ThreadSummary target = resolveRequiredThread(prefix, true);
+        if (target == null) {
+            return;
+        }
+        ThreadSummary unarchived = appServerSession.threadUnarchive(new ThreadUnarchiveParams(target.threadId())).thread();
+        System.out.println("Unarchived thread: " + shortThreadId(unarchived.threadId()));
+    }
+
+    private void handleRollbackCommand(String arguments) {
+        String remainder = arguments == null ? "" : arguments.trim();
+        if (remainder.isEmpty()) {
+            System.out.println("Usage: :rollback [thread-id-prefix] <turn-count>");
+            return;
+        }
+        String[] parts = remainder.split("\\s+");
+        ThreadId targetThreadId;
+        int turnCount;
+        if (parts.length == 1) {
+            targetThreadId = activeThreadId;
+            turnCount = parseRollbackCount(parts[0]);
+        }
+        else if (parts.length == 2) {
+            ThreadSummary target = resolveRequiredThread(parts[0], true);
+            if (target == null) {
+                return;
+            }
+            targetThreadId = target.threadId();
+            turnCount = parseRollbackCount(parts[1]);
+        }
+        else {
+            System.out.println("Usage: :rollback [thread-id-prefix] <turn-count>");
+            return;
+        }
+        if (turnCount < 1) {
+            return;
+        }
+        var response = appServerSession.threadRollback(new ThreadRollbackParams(targetThreadId, turnCount));
+        System.out.printf("Rolled back %d turn(s) on thread %s. Remaining turns=%d%n",
+                turnCount,
+                shortThreadId(targetThreadId),
+                response.thread().turnCount());
+    }
+
+    private int parseRollbackCount(String rawValue) {
+        try {
+            int parsed = Integer.parseInt(rawValue);
+            if (parsed < 1) {
+                System.out.println("Turn count must be >= 1.");
+                return -1;
+            }
+            return parsed;
+        }
+        catch (NumberFormatException exception) {
+            System.out.println("Invalid turn count: " + rawValue);
+            return -1;
+        }
+    }
+
+    private void printSubagents(String arguments) {
+        ThreadSummary target = arguments == null || arguments.isBlank()
+                ? findThreadById(activeThreadId)
+                : resolveRequiredThread(arguments.trim(), true);
+        if (target == null) {
+            return;
+        }
+        ThreadReadResponse response = appServerSession.threadRead(new ThreadReadParams(target.threadId(), false));
+        List<ThreadSummary> threadTree = new ArrayList<>();
+        threadTree.add(response.thread());
+        threadTree.addAll(response.relatedThreads());
+        if (threadTree.size() == 1 && response.thread().parentThreadId() == null) {
+            System.out.println("No related sub-agent threads for " + shortThreadId(response.thread().threadId()) + ".");
+            return;
+        }
+
+        Map<ThreadId, ThreadSummary> threadsById = new LinkedHashMap<>();
+        for (ThreadSummary thread : threadTree) {
+            threadsById.put(thread.threadId(), thread);
+        }
+        Map<ThreadId, List<ThreadSummary>> childrenByParent = new LinkedHashMap<>();
+        for (ThreadSummary thread : threadTree) {
+            if (thread.parentThreadId() == null) {
+                continue;
+            }
+            childrenByParent.computeIfAbsent(thread.parentThreadId(), ignored -> new ArrayList<>()).add(thread);
+        }
+
+        ThreadId rootThreadId = response.treeRootThreadId() == null ? response.thread().threadId() : response.treeRootThreadId();
+        ThreadSummary root = threadsById.getOrDefault(rootThreadId, response.thread());
+        System.out.printf("Thread tree rooted at %s:%n", shortThreadId(root.threadId()));
+        printThreadTreeNode(root, childrenByParent, 0, response.thread().threadId());
+    }
+
+    private void printThreadTreeNode(ThreadSummary thread,
+                                     Map<ThreadId, List<ThreadSummary>> childrenByParent,
+                                     int depth,
+                                     ThreadId focusedThreadId) {
+        String indent = "  ".repeat(depth);
+        String marker = thread.threadId().equals(activeThreadId)
+                ? "*"
+                : thread.threadId().equals(focusedThreadId) ? ">" : "-";
+        List<String> tags = new ArrayList<>();
+        tags.add(formatEnum(thread.status()));
+        if (thread.parentThreadId() != null) {
+            tags.add("sub-agent");
+        }
+        if (thread.agentStatus() != null) {
+            tags.add("agent=" + formatEnum(thread.agentStatus()));
+        }
+        if (thread.archived()) {
+            tags.add("archived");
+        }
+        System.out.printf("%s%s %s  %s  [%s]%n",
+                indent,
+                marker,
+                shortThreadId(thread.threadId()),
+                thread.title(),
+                String.join(", ", tags));
+        if (thread.agentNickname() != null || thread.agentRole() != null || thread.agentPath() != null) {
+            List<String> agentDetails = new ArrayList<>();
+            if (thread.agentNickname() != null) {
+                agentDetails.add("nickname=" + thread.agentNickname());
+            }
+            if (thread.agentRole() != null) {
+                agentDetails.add("role=" + thread.agentRole());
+            }
+            if (thread.agentPath() != null) {
+                agentDetails.add("path=" + thread.agentPath());
+            }
+            System.out.printf("%s  agent: %s%n", indent, String.join("  ", agentDetails));
+        }
+        for (ThreadSummary child : childrenByParent.getOrDefault(thread.threadId(), List.of())) {
+            printThreadTreeNode(child, childrenByParent, depth + 1, focusedThreadId);
+        }
+    }
+
+    private void handleAgentCommand(String arguments) {
+        String remainder = arguments == null ? "" : arguments.trim();
+        if (remainder.isEmpty()) {
+            System.out.println("Usage: :agent <tree|use> ...");
+            return;
+        }
+        if (isCommand(remainder, "tree")) {
+            printSubagents(commandArguments(remainder, "tree"));
+            return;
+        }
+        if (isCommand(remainder, "use")) {
+            String requestedThread = commandArguments(remainder, "use");
+            if (requestedThread.isEmpty()) {
+                System.out.println("Usage: :agent use <thread-id-prefix>");
+                return;
+            }
+            switchActiveThread(requestedThread);
+            return;
+        }
+        System.out.println("Usage: :agent <tree|use> ...");
+    }
+
+    private List<ThreadSummary> fetchThreads(Boolean archived) {
+        List<ThreadSummary> threads = new ArrayList<>();
+        String cursor = null;
+        do {
+            ThreadListResponse response = appServerSession.threadList(new ThreadListParams(
+                    cursor,
+                    100,
+                    null,
+                    null,
+                    null,
+                    archived,
+                    null,
+                    null));
+            threads.addAll(response.threads());
+            cursor = response.nextCursor();
+        }
+        while (cursor != null);
+        return threads;
+    }
+
+    private List<ThreadSummary> fetchAllThreads() {
+        Map<String, ThreadSummary> threadsById = new LinkedHashMap<>();
+        for (ThreadSummary thread : fetchThreads(false)) {
+            threadsById.put(thread.threadId().value(), thread);
+        }
+        for (ThreadSummary thread : fetchThreads(true)) {
+            threadsById.put(thread.threadId().value(), thread);
+        }
+        return new ArrayList<>(threadsById.values());
+    }
+
+    private List<ThreadId> fetchLoadedThreadIds() {
+        List<ThreadId> loaded = new ArrayList<>();
+        String cursor = null;
+        do {
+            var response = appServerSession.threadLoadedList(new ThreadLoadedListParams(cursor, 100));
+            loaded.addAll(response.data());
+            cursor = response.nextCursor();
+        }
+        while (cursor != null);
+        return loaded;
+    }
+
+    private ThreadSummary findThreadById(ThreadId threadId) {
+        return fetchAllThreads().stream()
+                .filter(thread -> thread.threadId().equals(threadId))
+                .findFirst()
+                .orElse(null);
+    }
+
+    private ThreadSummary resolveRequiredThread(String prefix, boolean includeArchived) {
+        List<ThreadSummary> matches = findMatchingThreads(prefix, includeArchived);
+        if (matches.isEmpty()) {
+            System.out.println("No thread matched: " + prefix);
+            return null;
+        }
+        if (matches.size() > 1) {
+            printAmbiguousThreads(prefix, matches);
+            return null;
+        }
+        return matches.get(0);
+    }
+
+    private List<ThreadSummary> findMatchingThreads(String prefix, boolean includeArchived) {
+        List<ThreadSummary> threads = includeArchived ? fetchAllThreads() : fetchThreads(false);
+        return threads.stream()
+                .filter(thread -> thread.threadId().value().startsWith(prefix))
+                .toList();
+    }
+
+    private void printAmbiguousThreads(String prefix, List<ThreadSummary> matches) {
+        System.out.println("Multiple threads matched " + prefix + ":");
+        for (ThreadSummary thread : matches) {
+            System.out.printf("  %s  %s%n", shortThreadId(thread.threadId()), thread.title());
+        }
+    }
+
+    private void switchAfterArchivingActiveThread(ThreadId archivedThreadId) {
+        List<ThreadSummary> candidates = fetchThreads(false).stream()
+                .filter(thread -> !thread.threadId().equals(archivedThreadId))
+                .toList();
+        if (candidates.isEmpty()) {
+            activeThreadId = createThread("Thread " + threadSequence++);
+            System.out.println("Started replacement thread: " + shortThreadId(activeThreadId));
+            return;
+        }
+        ThreadSummary replacement = candidates.get(0);
+        if (!replacement.loaded() && !replacement.archived()) {
+            appServerSession.threadResume(new ThreadResumeParams(replacement.threadId()));
+        }
+        activeThreadId = replacement.threadId();
+        System.out.println("Switched to thread: " + shortThreadId(activeThreadId));
+    }
+
+    private String formatEnum(Enum<?> value) {
+        if (value == null) {
+            return "unknown";
+        }
+        return value.name().toLowerCase().replace('_', '-');
+    }
+
+    private String formatThreadFlag(ThreadActiveFlag flag) {
+        return formatEnum(flag);
+    }
+
+    private String formatThreadSource(ThreadSource source) {
+        return formatEnum(source);
+    }
+
+    private String blankToNull(String value) {
+        return value == null || value.isBlank() ? null : value.trim();
     }
 
     private void waitForTurn(TurnStarter turnStarter) {

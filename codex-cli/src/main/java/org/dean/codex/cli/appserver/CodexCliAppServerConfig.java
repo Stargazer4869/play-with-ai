@@ -2,12 +2,14 @@ package org.dean.codex.cli.appserver;
 
 import org.dean.codex.cli.appserver.transport.jsonrpc.StdioProcessCodexAppServer;
 import org.dean.codex.core.appserver.CodexAppServer;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Primary;
 
 @Configuration
+@ConditionalOnProperty(name = "codex.cli.enabled", havingValue = "true", matchIfMissing = true)
 @EnableConfigurationProperties(CodexCliAppServerProperties.class)
 public class CodexCliAppServerConfig {
 
