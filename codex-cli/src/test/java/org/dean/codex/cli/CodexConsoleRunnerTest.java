@@ -36,6 +36,7 @@ import org.dean.codex.protocol.appserver.ThreadStartedNotification;
 import org.dean.codex.protocol.appserver.ThreadUnarchiveParams;
 import org.dean.codex.protocol.appserver.ThreadUnarchiveResponse;
 import org.dean.codex.protocol.appserver.TurnCompletedNotification;
+import org.dean.codex.protocol.appserver.TurnStartedNotification;
 import org.dean.codex.protocol.appserver.TurnInterruptParams;
 import org.dean.codex.protocol.appserver.TurnInterruptResponse;
 import org.dean.codex.protocol.appserver.TurnResumeParams;
@@ -45,6 +46,7 @@ import org.dean.codex.protocol.appserver.TurnStartResponse;
 import org.dean.codex.protocol.appserver.TurnSteerParams;
 import org.dean.codex.protocol.appserver.TurnSteerResponse;
 import org.dean.codex.protocol.conversation.ConversationTurn;
+import org.dean.codex.protocol.conversation.ItemId;
 import org.dean.codex.protocol.approval.ApprovalId;
 import org.dean.codex.protocol.approval.ApprovalStatus;
 import org.dean.codex.protocol.approval.CommandApprovalRequest;
@@ -59,10 +61,13 @@ import org.dean.codex.protocol.conversation.TurnStatus;
 import org.dean.codex.protocol.runtime.RuntimeTurn;
 import org.dean.codex.protocol.skill.SkillMetadata;
 import org.dean.codex.protocol.skill.SkillScope;
+import org.dean.codex.protocol.item.ToolCallItem;
+import org.dean.codex.protocol.item.ToolResultItem;
 import org.dean.codex.protocol.tool.CommandApprovalDecision;
 import org.dean.codex.protocol.tool.ShellCommandResult;
 import org.junit.jupiter.api.Test;
 
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
@@ -91,7 +96,7 @@ class CodexConsoleRunnerTest {
         PrintStream originalOut = System.out;
         try {
             System.setOut(new PrintStream(output, true, StandardCharsets.UTF_8));
-            assertTrue(runner.handleConsoleCommand(":new"));
+            assertTrue(runner.handleConsoleCommand("/new"));
         }
         finally {
             System.setOut(originalOut);
@@ -102,6 +107,31 @@ class CodexConsoleRunnerTest {
     }
 
     @Test
+    void constructorAndHelpDoNotInitializeInteractiveSession() throws Exception {
+        StubAppServer runtime = new StubAppServer();
+        CodexConsoleRunner runner = new CodexConsoleRunner(runtime, new StubApprovalService());
+
+        assertEquals(0, runtime.connectCount());
+
+        String console = captureConsole(() -> assertTrue(runner.handleConsoleCommand("/help")));
+
+        assertEquals(0, runtime.connectCount());
+        assertTrue(console.contains("Interactive commands use /command syntax"));
+    }
+
+    @Test
+    void topLevelHelpUsesRootParserWithoutInitializingInteractiveSession() throws Exception {
+        StubAppServer runtime = new StubAppServer();
+        CodexConsoleRunner runner = new CodexConsoleRunner(runtime, new StubApprovalService());
+
+        CapturedRun captured = captureRun(() -> runner.run("--help"), "");
+
+        assertEquals(0, runtime.connectCount());
+        assertTrue(captured.stdout().contains("Usage: codex"));
+        assertFalse(captured.stdout().contains("Codex CLI. Active thread"));
+    }
+
+    @Test
     void listsThreadsFromConsoleCommand() throws Exception {
         CodexConsoleRunner runner = new CodexConsoleRunner(new StubAppServer(), new StubApprovalService());
 
@@ -109,7 +139,7 @@ class CodexConsoleRunnerTest {
         PrintStream originalOut = System.out;
         try {
             System.setOut(new PrintStream(output, true, StandardCharsets.UTF_8));
-            assertTrue(runner.handleConsoleCommand(":threads"));
+            assertTrue(runner.handleConsoleCommand("/threads"));
         }
         finally {
             System.setOut(originalOut);
@@ -135,7 +165,7 @@ class CodexConsoleRunnerTest {
         PrintStream originalOut = System.out;
         try {
             System.setOut(new PrintStream(output, true, StandardCharsets.UTF_8));
-            assertTrue(runner.handleConsoleCommand(":approvals"));
+            assertTrue(runner.handleConsoleCommand("/approvals"));
         }
         finally {
             System.setOut(originalOut);
@@ -154,7 +184,7 @@ class CodexConsoleRunnerTest {
         PrintStream originalOut = System.out;
         try {
             System.setOut(new PrintStream(output, true, StandardCharsets.UTF_8));
-            assertTrue(runner.handleConsoleCommand(":skills"));
+            assertTrue(runner.handleConsoleCommand("/skills"));
         }
         finally {
             System.setOut(originalOut);
@@ -166,13 +196,36 @@ class CodexConsoleRunnerTest {
     }
 
     @Test
+    void streamedToolActivityIsRenderedClearly() throws Exception {
+        StubAppServer runtime = new StubAppServer(true, false, true);
+        CodexConsoleRunner runner = new CodexConsoleRunner(runtime, new StubApprovalService());
+
+        CapturedRun captured = captureRun(() -> runner.run(), "inspect repo\n");
+
+        assertTrue(captured.stdout().contains("[tool:start] run command -> ls -la"));
+        assertTrue(captured.stdout().contains("[tool:done] run command -> success=true exitCode=0"));
+    }
+
+    @Test
+    void helpOutputAdvertisesSlashCommandsAndLegacyAliases() throws Exception {
+        CodexConsoleRunner runner = new CodexConsoleRunner(new StubAppServer(), new StubApprovalService());
+
+        String console = captureConsole(() -> assertTrue(runner.handleConsoleCommand("/help")));
+        assertTrue(console.contains("Interactive commands use /command syntax"));
+        assertTrue(console.contains("/threads [all|loaded|archived]"));
+    }
+
+    @Test
     void applicationConfigImportsSharedRuntimeDefaults() throws Exception {
         try (var inputStream = CodexConsoleRunnerTest.class.getResourceAsStream("/application.yml")) {
             assertNotNull(inputStream);
             String config = new String(inputStream.readAllBytes(), StandardCharsets.UTF_8);
-            assertTrue(config.contains("import: optional:classpath:codex-runtime-defaults.yml"));
-            assertTrue(config.contains("web-application-type: none"));
-        }
+        assertTrue(config.contains("import: optional:classpath:codex-runtime-defaults.yml"));
+        assertTrue(config.contains("web-application-type: none"));
+        assertTrue(config.contains("org.dean.codex: ${CODEX_LOG_LEVEL:WARN}"));
+        assertTrue(config.contains("SimpleLoggerAdvisor: OFF"));
+        assertTrue(config.contains("show-tool-activity: ${CODEX_SHOW_TOOL_ACTIVITY:true}"));
+    }
     }
 
     @Test
@@ -183,7 +236,7 @@ class CodexConsoleRunnerTest {
         PrintStream originalOut = System.out;
         try {
             System.setOut(new PrintStream(output, true, StandardCharsets.UTF_8));
-            assertTrue(runner.handleConsoleCommand(":approve approval-"));
+            assertTrue(runner.handleConsoleCommand("/approve approval-"));
         }
         finally {
             System.setOut(originalOut);
@@ -198,7 +251,7 @@ class CodexConsoleRunnerTest {
     void compactCommandPrintsCompactionLifecycleAndCompatibilitySnapshot() throws Exception {
         CodexConsoleRunner runner = new CodexConsoleRunner(new StubAppServer(), new StubApprovalService());
 
-        String console = captureConsole(() -> assertTrue(runner.handleConsoleCommand(":compact")));
+        String console = captureConsole(() -> assertTrue(runner.handleConsoleCommand("/compact")));
         assertTrue(console.contains("[compaction] started"));
         assertTrue(console.contains("[compaction] completed"));
         assertTrue(console.contains("[compaction] response"));
@@ -210,7 +263,7 @@ class CodexConsoleRunnerTest {
         StubAppServer runtime = new StubAppServer();
         CodexConsoleRunner runner = new CodexConsoleRunner(runtime, new StubApprovalService());
 
-        String console = captureConsole(() -> assertTrue(runner.handleConsoleCommand(":resume " + shortId(runtime.subagentThreadId()))));
+        String console = captureConsole(() -> assertTrue(runner.handleConsoleCommand("/resume " + shortId(runtime.subagentThreadId()))));
 
         assertEquals(runtime.subagentThreadId(), runner.getActiveThreadIdForTest());
         assertTrue(console.contains("Switched to thread"));
@@ -222,7 +275,7 @@ class CodexConsoleRunnerTest {
         CodexConsoleRunner runner = new CodexConsoleRunner(runtime, new StubApprovalService());
         ThreadId originalThread = runner.getActiveThreadIdForTest();
 
-        String console = captureConsole(() -> assertTrue(runner.handleConsoleCommand(":fork worker review")));
+        String console = captureConsole(() -> assertTrue(runner.handleConsoleCommand("/fork worker review")));
 
         assertNotEquals(originalThread, runner.getActiveThreadIdForTest());
         assertTrue(console.contains("Forked thread"));
@@ -235,7 +288,7 @@ class CodexConsoleRunnerTest {
         CodexConsoleRunner runner = new CodexConsoleRunner(runtime, new StubApprovalService());
         ThreadId originalThread = runner.getActiveThreadIdForTest();
 
-        String console = captureConsole(() -> assertTrue(runner.handleConsoleCommand(":archive")));
+        String console = captureConsole(() -> assertTrue(runner.handleConsoleCommand("/archive")));
 
         assertNotEquals(originalThread, runner.getActiveThreadIdForTest());
         assertTrue(console.contains("Archived thread"));
@@ -248,7 +301,7 @@ class CodexConsoleRunnerTest {
         CodexConsoleRunner runner = new CodexConsoleRunner(runtime, new StubApprovalService());
         runtime.addCompletedTurn(runner.getActiveThreadIdForTest(), "Inspect repo");
 
-        String console = captureConsole(() -> assertTrue(runner.handleConsoleCommand(":rollback 1")));
+        String console = captureConsole(() -> assertTrue(runner.handleConsoleCommand("/rollback 1")));
 
         assertEquals(0, runtime.turnCount(runner.getActiveThreadIdForTest()));
         assertTrue(console.contains("Rolled back 1 turn(s)"));
@@ -260,7 +313,7 @@ class CodexConsoleRunnerTest {
         StubAppServer runtime = new StubAppServer();
         CodexConsoleRunner runner = new CodexConsoleRunner(runtime, new StubApprovalService());
 
-        String console = captureConsole(() -> assertTrue(runner.handleConsoleCommand(":subagents")));
+        String console = captureConsole(() -> assertTrue(runner.handleConsoleCommand("/subagents")));
 
         assertTrue(console.contains("Thread tree rooted at"));
         assertTrue(console.contains("Worker thread"));
@@ -272,10 +325,125 @@ class CodexConsoleRunnerTest {
         StubAppServer runtime = new StubAppServer();
         CodexConsoleRunner runner = new CodexConsoleRunner(runtime, new StubApprovalService());
 
-        String console = captureConsole(() -> assertTrue(runner.handleConsoleCommand(":agent use " + shortId(runtime.subagentThreadId()))));
+        String console = captureConsole(() -> assertTrue(runner.handleConsoleCommand("/agent use " + shortId(runtime.subagentThreadId()))));
 
         assertEquals(runtime.subagentThreadId(), runner.getActiveThreadIdForTest());
         assertTrue(console.contains("Switched to thread"));
+    }
+
+    @Test
+    void topLevelResumeCommandSelectsRequestedThreadBeforeInteractiveLoop() throws Exception {
+        StubAppServer runtime = new StubAppServer();
+        CodexConsoleRunner runner = new CodexConsoleRunner(runtime, new StubApprovalService());
+
+        CapturedRun captured = captureRun(
+                () -> runner.run("resume", shortId(runtime.subagentThreadId())),
+                "");
+
+        assertEquals(runtime.subagentThreadId(), runner.getActiveThreadIdForTest());
+        assertTrue(captured.stdout().contains("Codex CLI. Active thread"));
+        assertTrue(captured.stdout().contains(shortId(runtime.subagentThreadId())));
+    }
+
+    @Test
+    void topLevelForkCommandCreatesForkAndEntersInteractiveLoop() throws Exception {
+        StubAppServer runtime = new StubAppServer();
+        CodexConsoleRunner runner = new CodexConsoleRunner(runtime, new StubApprovalService());
+        ThreadId originalThread = runtime.rootThreadId();
+
+        CapturedRun captured = captureRun(
+                () -> runner.run("fork", shortId(originalThread)),
+                "");
+
+        assertNotEquals(originalThread, runner.getActiveThreadIdForTest());
+        assertTrue(captured.stdout().contains("Forked thread"));
+        assertTrue(captured.stdout().contains("Codex CLI. Active thread"));
+    }
+
+    @Test
+    void interactiveStartupResumesPersistedButUnloadedActiveThreadBeforeFirstTurn() throws Exception {
+        StubAppServer runtime = new StubAppServer(false, false);
+        CodexConsoleRunner runner = new CodexConsoleRunner(runtime, new StubApprovalService());
+
+        CapturedRun captured = captureRun(() -> runner.run(), "hello\n");
+
+        assertEquals(runtime.rootThreadId(), runner.getActiveThreadIdForTest());
+        assertTrue(runtime.resumeAttemptCount() >= 1);
+        assertTrue(runtime.resumeCount() >= 1);
+        assertTrue(captured.stdout().contains("handled: hello"));
+    }
+
+    @Test
+    void interactiveStartupCreatesReplacementThreadWhenPersistedThreadsCannotBeResumed() throws Exception {
+        StubAppServer runtime = new StubAppServer(false, true);
+        CodexConsoleRunner runner = new CodexConsoleRunner(runtime, new StubApprovalService());
+
+        CapturedRun captured = captureRun(() -> runner.run(), "hello\n");
+
+        ThreadId active = runner.getActiveThreadIdForTest();
+        assertNotEquals(runtime.rootThreadId(), active);
+        assertNotEquals(runtime.subagentThreadId(), active);
+        assertTrue(runtime.resumeAttemptCount() >= 2);
+        assertTrue(captured.stdout().contains("handled: hello"));
+    }
+
+    @Test
+    void sharedRootOverridesAreCarriedThroughTopLevelCompletion() throws Exception {
+        StubAppServer runtime = new StubAppServer();
+        CodexConsoleRunner runner = new CodexConsoleRunner(runtime, new StubApprovalService());
+
+        captureRun(
+                () -> runner.run("--model", "gpt-5.4", "--cd", "./workspace", "--sandbox", "workspace-write",
+                        "--approval-mode", "review-sensitive", "completion", "--shell", "bash"),
+                "");
+
+        assertEquals("gpt-5.4", runner.getLaunchOverridesForTest().model());
+        assertEquals("./workspace", runner.getLaunchOverridesForTest().cd());
+        assertEquals(org.dean.codex.cli.config.CliSandboxMode.WORKSPACE_WRITE, runner.getLaunchOverridesForTest().sandbox());
+        assertEquals(org.dean.codex.cli.config.CliApprovalMode.REVIEW_SENSITIVE, runner.getLaunchOverridesForTest().approvalMode());
+    }
+
+    @Test
+    void topLevelForkAppliesSupportedLaunchOverridesToForkRequest() throws Exception {
+        StubAppServer runtime = new StubAppServer();
+        CodexConsoleRunner runner = new CodexConsoleRunner(runtime, new StubApprovalService());
+        ThreadId originalThread = runtime.rootThreadId();
+
+        captureRun(
+                () -> runner.run("--model", "gpt-5.4", "--cd", "./workspace", "fork", shortId(originalThread)),
+                "");
+
+        assertEquals("./workspace", runtime.lastForkParams().cwd());
+        assertEquals("gpt-5.4", runtime.lastForkParams().model());
+    }
+
+    @Test
+    void topLevelCompletionCommandPrintsScriptWithoutStartingSession() throws Exception {
+        StubAppServer runtime = new StubAppServer();
+        CodexConsoleRunner runner = new CodexConsoleRunner(runtime, new StubApprovalService());
+
+        CapturedRun captured = captureRun(
+                () -> runner.run("completion", "--shell", "bash"),
+                "");
+
+        assertEquals(0, runtime.connectCount());
+        assertFalse(captured.stdout().isBlank());
+        assertFalse(captured.stdout().contains("Codex CLI. Active thread"));
+    }
+
+    @Test
+    void unsupportedTopLevelNonInteractiveCommandFailsClearlyWithoutReplFallback() throws Exception {
+        StubAppServer runtime = new StubAppServer();
+        CodexConsoleRunner runner = new CodexConsoleRunner(runtime, new StubApprovalService());
+
+        CapturedRun captured = captureRun(
+                () -> runner.run("exec", "plan", "next", "step"),
+                "");
+
+        assertEquals(0, runtime.connectCount());
+        assertTrue(captured.stderr().contains("exec"));
+        assertTrue(captured.stderr().contains("not wired to runtime yet"));
+        assertFalse(captured.stdout().contains("Codex CLI. Active thread"));
     }
 
     private static String captureConsole(ThrowingRunnable action) throws Exception {
@@ -291,6 +459,26 @@ class CodexConsoleRunnerTest {
         return output.toString(StandardCharsets.UTF_8);
     }
 
+    private static CapturedRun captureRun(ThrowingRunnable action, String stdin) throws Exception {
+        ByteArrayOutputStream stdout = new ByteArrayOutputStream();
+        ByteArrayOutputStream stderr = new ByteArrayOutputStream();
+        PrintStream originalOut = System.out;
+        PrintStream originalErr = System.err;
+        java.io.InputStream originalIn = System.in;
+        try {
+            System.setIn(new ByteArrayInputStream(stdin.getBytes(StandardCharsets.UTF_8)));
+            System.setOut(new PrintStream(stdout, true, StandardCharsets.UTF_8));
+            System.setErr(new PrintStream(stderr, true, StandardCharsets.UTF_8));
+            action.run();
+        }
+        finally {
+            System.setIn(originalIn);
+            System.setOut(originalOut);
+            System.setErr(originalErr);
+        }
+        return new CapturedRun(stdout.toString(StandardCharsets.UTF_8), stderr.toString(StandardCharsets.UTF_8));
+    }
+
     private static String shortId(ThreadId threadId) {
         String value = threadId.value();
         return value.length() <= 8 ? value : value.substring(0, 8);
@@ -300,19 +488,43 @@ class CodexConsoleRunnerTest {
 
         private final ConversationStore store = new InMemoryConversationStore();
         private final Set<ThreadId> loadedThreadIds = new LinkedHashSet<>();
+        private final Set<ThreadId> resumedThreadIds = new LinkedHashSet<>();
         private final ThreadId rootThreadId;
         private final ThreadId subagentThreadId;
+        private final boolean failResumeForExistingThreads;
+        private final boolean emitToolActivity;
+        private int connectCount;
+        private int resumeAttemptCount;
+        private ThreadForkParams lastForkParams;
 
         private StubAppServer() {
+            this(true, false, false);
+        }
+
+        private StubAppServer(boolean preloadThreadsAsLoaded, boolean failResumeForExistingThreads) {
+            this(preloadThreadsAsLoaded, failResumeForExistingThreads, false);
+        }
+
+        private StubAppServer(boolean preloadThreadsAsLoaded,
+                              boolean failResumeForExistingThreads,
+                              boolean emitToolActivity) {
             this.rootThreadId = store.createThread("Thread 1");
             this.subagentThreadId = store.createThread("Worker thread");
-            loadedThreadIds.add(rootThreadId);
-            loadedThreadIds.add(subagentThreadId);
+            this.failResumeForExistingThreads = failResumeForExistingThreads;
+            this.emitToolActivity = emitToolActivity;
+            if (preloadThreadsAsLoaded) {
+                loadedThreadIds.add(rootThreadId);
+                loadedThreadIds.add(subagentThreadId);
+            }
             store.updateAgentThread(subagentThreadId, rootThreadId, 1, null, "worker", "explorer", "src/demo");
         }
 
         private ThreadId subagentThreadId() {
             return subagentThreadId;
+        }
+
+        private ThreadId rootThreadId() {
+            return rootThreadId;
         }
 
         private void addCompletedTurn(ThreadId threadId, String input) {
@@ -325,8 +537,25 @@ class CodexConsoleRunnerTest {
             return store.turns(threadId).size();
         }
 
+        private int connectCount() {
+            return connectCount;
+        }
+
+        private ThreadForkParams lastForkParams() {
+            return lastForkParams;
+        }
+
+        private int resumeCount() {
+            return resumedThreadIds.size();
+        }
+
+        private int resumeAttemptCount() {
+            return resumeAttemptCount;
+        }
+
         @Override
         public CodexAppServerSession connect() {
+            connectCount++;
             return new StubSession();
         }
 
@@ -408,10 +637,16 @@ class CodexConsoleRunnerTest {
             public ThreadResumeResponse threadResume(ThreadResumeParams params) {
                 ensureReady();
                 ThreadId threadId = params.threadId();
+                resumeAttemptCount++;
                 if (requireThread(threadId).archived()) {
                     throw new IllegalArgumentException("Archived thread id: " + threadId.value());
                 }
+                if (failResumeForExistingThreads
+                        && (threadId.equals(rootThreadId) || threadId.equals(subagentThreadId))) {
+                    throw new IllegalStateException("Injected resume failure for startup thread: " + threadId.value());
+                }
                 loadedThreadIds.add(threadId);
+                resumedThreadIds.add(threadId);
                 return new ThreadResumeResponse(runtimeSummary(threadId));
             }
 
@@ -460,6 +695,7 @@ class CodexConsoleRunnerTest {
             @Override
             public ThreadForkResponse threadFork(ThreadForkParams params) {
                 ensureReady();
+                lastForkParams = params;
                 ThreadId threadId = store.forkThread(params);
                 loadedThreadIds.add(threadId);
                 return new ThreadForkResponse(runtimeSummary(threadId));
@@ -537,9 +773,22 @@ class CodexConsoleRunnerTest {
             public TurnStartResponse turnStart(TurnStartParams params) {
                 ensureReady();
                 ThreadId threadId = params.threadId();
+                if (!loadedThreadIds.contains(threadId)) {
+                    throw new IllegalStateException("Thread is not loaded: " + threadId.value());
+                }
                 String input = params.input();
                 Instant now = Instant.now();
                 TurnId turnId = store.startTurn(threadId, input, now);
+                if (emitToolActivity) {
+                    RuntimeTurn runningTurn = new RuntimeTurn(threadId, turnId, TurnStatus.RUNNING, now, null);
+                    publish(threadId, new TurnStartedNotification(runningTurn));
+                    publish(threadId, new org.dean.codex.protocol.appserver.TurnItemNotification(
+                            runningTurn,
+                            new ToolCallItem(new ItemId("tool-call-1"), "RUN_COMMAND", "ls -la", now.plusMillis(1))));
+                    publish(threadId, new org.dean.codex.protocol.appserver.TurnItemNotification(
+                            runningTurn,
+                            new ToolResultItem(new ItemId("tool-result-1"), "RUN_COMMAND", "success=true exitCode=0", now.plusMillis(2))));
+                }
                 store.completeTurn(threadId, turnId, TurnStatus.COMPLETED, "handled: " + input, now.plusSeconds(1));
                 publish(threadId, new TurnCompletedNotification(
                         new RuntimeTurn(threadId, turnId, TurnStatus.COMPLETED, now, now.plusSeconds(1)),
@@ -618,6 +867,9 @@ class CodexConsoleRunnerTest {
                         Instant.now());
             }
         }
+    }
+
+    private record CapturedRun(String stdout, String stderr) {
     }
 
     private static final class StubApprovalService implements CommandApprovalService {

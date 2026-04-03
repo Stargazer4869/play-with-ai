@@ -1,5 +1,6 @@
 package org.dean.codex.cli.appserver.transport.jsonrpc;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.dean.codex.core.agent.TurnControl;
 import org.dean.codex.core.agent.TurnExecutor;
 import org.dean.codex.core.appserver.CodexAppServer;
@@ -13,6 +14,7 @@ import org.dean.codex.protocol.appserver.AppServerCapabilities;
 import org.dean.codex.protocol.appserver.AppServerClientInfo;
 import org.dean.codex.protocol.appserver.AppServerNotification;
 import org.dean.codex.protocol.appserver.InitializeParams;
+import org.dean.codex.protocol.appserver.InitializeResponse;
 import org.dean.codex.protocol.appserver.InitializedNotification;
 import org.dean.codex.protocol.appserver.ThreadArchiveParams;
 import org.dean.codex.protocol.appserver.ThreadForkParams;
@@ -44,6 +46,9 @@ import org.junit.jupiter.api.Test;
 
 import java.io.PipedInputStream;
 import java.io.PipedOutputStream;
+import java.io.BufferedWriter;
+import java.io.OutputStreamWriter;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
@@ -374,6 +379,50 @@ class JsonRpcCodexAppServerSessionTest {
 
         hostThread.join(1_000);
         assertNull(hostFailure.get(), "Host failed: " + hostFailure.get());
+    }
+
+    @Test
+    void sessionIgnoresStrayStdoutLinesAndStillProcessesJsonResponse() throws Exception {
+        PipedOutputStream clientToServer = new PipedOutputStream();
+        PipedInputStream serverInput = new PipedInputStream(clientToServer);
+        PipedOutputStream serverToClient = new PipedOutputStream();
+        PipedInputStream clientInput = new PipedInputStream(serverToClient);
+
+        Thread serverThread = new Thread(() -> {
+            try (BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(serverToClient, StandardCharsets.UTF_8))) {
+                Thread.sleep(100);
+                writer.write("10:59:26.708 [codex-runtime-1] ERROR io.netty.resolver.dns.DnsServerAddressStreamProviders -- Unable to load io.netty.resolver.dns.macos.MacOSDnsServerAddressStreamProvider");
+                writer.newLine();
+                writer.flush();
+                Thread.sleep(100);
+                writer.write(new ObjectMapper().writeValueAsString(new org.dean.codex.protocol.appserver.jsonrpc.JsonRpcResponseMessage(
+                        "2.0",
+                        new com.fasterxml.jackson.databind.node.LongNode(1),
+                        new ObjectMapper().valueToTree(new InitializeResponse("transport-client", "home", "linux", "os")),
+                        null)));
+                writer.newLine();
+                writer.flush();
+            }
+            catch (Exception ignored) {
+            }
+        }, "test-jsonrpc-stray-stdout");
+        serverThread.setDaemon(true);
+        serverThread.start();
+
+        try (JsonRpcCodexAppServerSession session = new JsonRpcCodexAppServerSession(
+                clientInput,
+                clientToServer,
+                () -> {
+                    clientToServer.close();
+                    serverThread.join(1_000);
+                    clientInput.close();
+                },
+                Duration.ofSeconds(3))) {
+            InitializeResponse response = session.initialize(new InitializeParams(
+                    new AppServerClientInfo("transport-client", "Transport Client", "1.0.0"),
+                    new AppServerCapabilities(false, List.of())));
+            assertEquals("transport-client", response.userAgent());
+        }
     }
 
     private List<AppServerNotification> awaitNotifications(BlockingQueue<AppServerNotification> notifications) throws InterruptedException {

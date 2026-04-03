@@ -4,10 +4,16 @@ spring:
   main:
     web-application-type: none
 
+logging:
+  level:
+    org.dean.codex: ${CODEX_LOG_LEVEL:WARN}
+    org.springframework.ai.chat.client.advisor.SimpleLoggerAdvisor: OFF
+
 codex:
   workspace-root: ${user.dir}
   storage-root: ${user.home}/.codex-java
   cli:
+    show-tool-activity: ${CODEX_SHOW_TOOL_ACTIVITY:true}
     app-server:
       main-class: ${CODEX_APP_SERVER_MAIN_CLASS:org.dean.codex.runtime.springai.appserver.CodexAppServerStdioApplication}
       request-timeout-seconds: ${CODEX_APP_SERVER_TIMEOUT_SECONDS:30}

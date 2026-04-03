@@ -13,8 +13,10 @@ import java.util.jar.JarFile;
 public class CodexCliAppServerProperties {
 
     private static final String CLI_ENABLED_OVERRIDE = "--codex.cli.enabled=false";
+    private static final String ROOT_LOGGING_OVERRIDE = "--logging.level.root=OFF";
+    private static final String CODEX_LOGGING_OVERRIDE = "--logging.level.org.dean.codex=OFF";
+    private static final String SIMPLE_LOGGER_ADVISOR_OVERRIDE = "--logging.level.org.springframework.ai.chat.client.advisor.SimpleLoggerAdvisor=OFF";
     private static final String SPRING_BOOT_JAR_LAUNCHER = "org.springframework.boot.loader.launch.JarLauncher";
-    private static final String SPRING_BOOT_PROPERTIES_LAUNCHER = "org.springframework.boot.loader.launch.PropertiesLauncher";
 
     private List<String> command = List.of();
     private String mainClass = "org.dean.codex.runtime.springai.appserver.CodexAppServerStdioApplication";
@@ -77,21 +79,23 @@ public class CodexCliAppServerProperties {
         generatedCommand.add(CLI_ENABLED_OVERRIDE);
         generatedCommand.add("--spring.main.banner-mode=off");
         generatedCommand.add("--spring.main.log-startup-info=false");
-        generatedCommand.add("--logging.level.root=OFF");
+        generatedCommand.add(ROOT_LOGGING_OVERRIDE);
+        generatedCommand.add(CODEX_LOGGING_OVERRIDE);
+        generatedCommand.add(SIMPLE_LOGGER_ADVISOR_OVERRIDE);
         return List.copyOf(generatedCommand);
     }
 
     private List<String> executableJarCommand(String javaBinary, String jarPath) {
         List<String> generatedCommand = new ArrayList<>();
         generatedCommand.add(javaBinary);
-        generatedCommand.add("-Dloader.main=" + mainClass);
-        generatedCommand.add("-cp");
+        generatedCommand.add("-jar");
         generatedCommand.add(jarPath);
-        generatedCommand.add(SPRING_BOOT_PROPERTIES_LAUNCHER);
         generatedCommand.add(CLI_ENABLED_OVERRIDE);
         generatedCommand.add("--spring.main.banner-mode=off");
         generatedCommand.add("--spring.main.log-startup-info=false");
-        generatedCommand.add("--logging.level.root=OFF");
+        generatedCommand.add(ROOT_LOGGING_OVERRIDE);
+        generatedCommand.add(CODEX_LOGGING_OVERRIDE);
+        generatedCommand.add(SIMPLE_LOGGER_ADVISOR_OVERRIDE);
         return List.copyOf(generatedCommand);
     }
 

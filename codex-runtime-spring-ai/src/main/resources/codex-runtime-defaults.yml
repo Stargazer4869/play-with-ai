@@ -3,8 +3,8 @@ spring:
     chat:
       client:
         observations:
-          log-prompt: true
-          log-completion: true
+          log-prompt: ${CODEX_CHAT_LOG_PROMPT:false}
+          log-completion: ${CODEX_CHAT_LOG_COMPLETION:false}
     model:
       chat: openai
     openai:

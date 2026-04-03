@@ -72,6 +72,7 @@ import java.util.function.Consumer;
 public class JsonRpcCodexAppServerSession implements CodexAppServerSession {
 
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper().findAndRegisterModules();
+    private static final org.slf4j.Logger logger = org.slf4j.LoggerFactory.getLogger(JsonRpcCodexAppServerSession.class);
 
     private static final int INVALID_PARAMS = -32602;
     private static final int METHOD_NOT_FOUND = -32601;
@@ -122,6 +123,7 @@ public class JsonRpcCodexAppServerSession implements CodexAppServerSession {
         this.readLoopThread = new Thread(this::readLoop, "codex-cli-appserver-jsonrpc-read-loop");
         this.readLoopThread.setDaemon(true);
         this.readLoopThread.start();
+        logger.debug("jsonrpc session started requestTimeoutMs={}", this.requestTimeout.toMillis());
     }
 
     @Override
@@ -225,23 +227,50 @@ public class JsonRpcCodexAppServerSession implements CodexAppServerSession {
         pendingResponses.clear();
         closeHook.close();
         readLoopThread.join(1000);
+        logger.debug("jsonrpc session closed");
     }
 
     private void readLoop() {
+        logger.debug("jsonrpc read loop started");
         try {
             String line;
             while ((line = reader.readLine()) != null) {
                 if (line.isBlank()) {
                     continue;
                 }
-                JsonNode node = objectMapper.readTree(line);
+                JsonNode node;
+                try {
+                    node = objectMapper.readTree(line);
+                }
+                catch (Exception parseException) {
+                    if (!looksLikeJson(line)) {
+                        logger.debug("jsonrpc ignored stray stdout line rawChars={} head={}",
+                                line.length(),
+                                sanitizeLine(line));
+                        continue;
+                    }
+                    logger.debug("jsonrpc malformed line rawChars={} head={} parseError={}",
+                            line.length(),
+                            sanitizeLine(line),
+                            parseException.getMessage());
+                    throw parseException;
+                }
                 if (node.has("method") && !node.has("id")) {
+                    logger.debug("jsonrpc notification received method={} paramsType={} rawChars={}",
+                            node.path("method").asText(""),
+                            notificationParamsType(node),
+                            line.length());
                     handleNotification(node);
                     continue;
                 }
                 JsonRpcResponseMessage response = objectMapper.treeToValue(node, JsonRpcResponseMessage.class);
                 CompletableFuture<JsonRpcResponseMessage> responseFuture = pendingResponses.remove(idKey(response.id()));
                 if (responseFuture != null) {
+                    logger.debug("jsonrpc response received id={} hasError={} hasResult={} pending={}",
+                            idKey(response.id()),
+                            response.error() != null,
+                            response.result() != null && !response.result().isNull(),
+                            pendingResponses.size());
                     responseFuture.complete(response);
                 }
             }
@@ -253,6 +282,9 @@ public class JsonRpcCodexAppServerSession implements CodexAppServerSession {
             if (!closed.get()) {
                 failSession(exception);
             }
+        }
+        finally {
+            logger.debug("jsonrpc read loop stopped");
         }
     }
 
@@ -267,6 +299,7 @@ public class JsonRpcCodexAppServerSession implements CodexAppServerSession {
             return;
         }
         AppServerNotification notification = objectMapper.treeToValue(params, type);
+        logger.debug("jsonrpc notification dispatch method={} type={}", method, type.getSimpleName());
         for (Consumer<AppServerNotification> listener : List.copyOf(listeners)) {
             try {
                 listener.accept(notification);
@@ -284,6 +317,12 @@ public class JsonRpcCodexAppServerSession implements CodexAppServerSession {
         String idKey = idKey(requestId);
         CompletableFuture<JsonRpcResponseMessage> responseFuture = new CompletableFuture<>();
         pendingResponses.put(idKey, responseFuture);
+        long startedNanos = System.nanoTime();
+        logger.debug("jsonrpc request send method={} id={} paramsType={} pending={}",
+                method,
+                idKey,
+                params == null ? "(null)" : params.getClass().getSimpleName(),
+                pendingResponses.size());
 
         try {
             write(new JsonRpcRequestMessage("2.0",
@@ -303,6 +342,13 @@ public class JsonRpcCodexAppServerSession implements CodexAppServerSession {
         finally {
             pendingResponses.remove(idKey);
         }
+        logger.debug("jsonrpc request complete method={} id={} elapsedMs={} hasError={} hasResult={} pending={}",
+                method,
+                idKey,
+                (System.nanoTime() - startedNanos) / 1_000_000L,
+                response.error() != null,
+                response.result() != null && !response.result().isNull(),
+                pendingResponses.size());
         if (response.error() != null) {
             throw mapError(method, response.error());
         }
@@ -324,6 +370,9 @@ public class JsonRpcCodexAppServerSession implements CodexAppServerSession {
     private void notifyOnly(String method, Object params) {
         ensureOpen();
         try {
+            logger.debug("jsonrpc notification send method={} paramsType={}",
+                    method,
+                    params == null ? "(null)" : params.getClass().getSimpleName());
             write(new JsonRpcRequestMessage("2.0",
                     null,
                     method,
@@ -398,9 +447,46 @@ public class JsonRpcCodexAppServerSession implements CodexAppServerSession {
         terminalFailure = failure;
         pendingResponses.values().forEach(responseFuture -> responseFuture.completeExceptionally(failure));
         pendingResponses.clear();
+        logger.debug("jsonrpc session failed cause={} type={} exception={}",
+                failure.getMessage(),
+                failure.getClass().getSimpleName(),
+                exception);
     }
 
     private String idKey(JsonNode id) {
         return id == null || id.isNull() ? "" : id.toString();
+    }
+
+    private String notificationParamsType(JsonNode node) {
+        JsonNode params = node.path("params");
+        if (params == null || params.isMissingNode() || params.isNull()) {
+            return "(null)";
+        }
+        if (params.isObject()) {
+            return "ObjectNode";
+        }
+        if (params.isArray()) {
+            return "ArrayNode";
+        }
+        return params.getNodeType().name();
+    }
+
+    private String sanitizeLine(String line) {
+        if (line == null || line.isBlank()) {
+            return "(blank)";
+        }
+        String compact = line.replace("\u001B", "\\u001B");
+        if (compact.length() <= 120) {
+            return compact;
+        }
+        return compact.substring(0, 120) + "...";
+    }
+
+    private boolean looksLikeJson(String line) {
+        if (line == null) {
+            return false;
+        }
+        String trimmed = line.trim();
+        return trimmed.startsWith("{") || trimmed.startsWith("[") || trimmed.startsWith("\"");
     }
 }

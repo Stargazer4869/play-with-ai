@@ -202,6 +202,12 @@ public class SpringAiCodexAgent implements CodexAgent {
         try {
             List<ResolvedSkill> selectedSkills = selectedSkillsForInput(safeInput);
             List<SkillMetadata> availableSkills = skillService.listSkills(false);
+            logger.debug("planner turn start thread={} turn={} inputChars={} selectedSkills={} availableSkills={}",
+                    threadId.value(),
+                    turnId.value(),
+                    safeInput.length(),
+                    selectedSkills.size(),
+                    availableSkills.size());
             List<TurnItem> preludeItems = new ArrayList<>();
             if (!selectedSkills.isEmpty()) {
                 SkillUseItem skillUseItem = skillUseItem(selectedSkills.stream().map(ResolvedSkill::metadata).toList());
@@ -269,8 +275,17 @@ public class SpringAiCodexAgent implements CodexAgent {
                         availableSkills,
                         steeringInputs);
             }
+            logger.debug("planner step start thread={} turn={} step={} scratchpadChars={} steeringInputs={} selectedSkills={} availableSkills={}",
+                    threadId.value(),
+                    turnId.value(),
+                    step,
+                    scratchpad.length(),
+                    steeringInputs.size(),
+                    selectedSkills.size(),
+                    availableSkills.size());
             PlannerStep decision = requestDecision(
                     threadId,
+                    turnId,
                     input,
                     scratchpad.toString(),
                     step,
@@ -362,6 +377,7 @@ public class SpringAiCodexAgent implements CodexAgent {
     }
 
     protected PlannerStep requestDecision(ThreadId threadId,
+                                          TurnId turnId,
                                           String input,
                                           String scratchpad,
                                           int step,
@@ -371,18 +387,41 @@ public class SpringAiCodexAgent implements CodexAgent {
         String systemPrompt = buildSystemPrompt(availableSkills);
         ReconstructedThreadContext reconstructedContext = threadContextReconstructionService.reconstruct(threadId);
         String userPrompt = buildUserPrompt(reconstructedContext, input, scratchpad, step, selectedSkills, steeringInputs);
-        logger.debug("Codex planner request step {}\nSystem:\n{}\nUser:\n{}", step, systemPrompt, userPrompt);
+        logger.debug("planner request start thread={} turn={} step={} systemChars={} userChars={} recentMessages={} recentTurns={} recentActivities={} selectedSkills={} availableSkills={} steeringInputs={}",
+                threadId.value(),
+                turnId == null ? "(null)" : turnId.value(),
+                step,
+                systemPrompt.length(),
+                userPrompt.length(),
+                reconstructedContext.recentMessages().size(),
+                reconstructedContext.recentTurns().size(),
+                reconstructedContext.recentActivities().size(),
+                selectedSkills.size(),
+                availableSkills.size(),
+                steeringInputs.size());
 
+        long startedNanos = System.nanoTime();
         String response = chatClient.prompt()
                 .system(systemPrompt)
                 .user(userPrompt)
                 .call()
                 .content();
-        logger.debug("Codex planner response step {}\n{}", step, response == null ? "(null)" : response);
+        logger.debug("planner request complete thread={} turn={} step={} elapsedMs={} responseChars={} responseNull={}",
+                threadId.value(),
+                turnId == null ? "(null)" : turnId.value(),
+                step,
+                (System.nanoTime() - startedNanos) / 1_000_000L,
+                response == null ? 0 : response.length(),
+                response == null);
 
         PlannerStep decision = parseDecision(response);
-        logger.debug("Codex planner parsed step {} actions={} finished={} summary={}",
-                step, decision.actions().size(), decision.isFinished(), blankToPlaceholder(decision.summary()));
+        logger.debug("planner decision parsed thread={} turn={} step={} actions={} finished={} summaryChars={}",
+                threadId.value(),
+                turnId == null ? "(null)" : turnId.value(),
+                step,
+                decision.actions().size(),
+                decision.isFinished(),
+                decision.summary() == null ? 0 : decision.summary().length());
         return decision;
     }
 
@@ -666,6 +705,9 @@ public class SpringAiCodexAgent implements CodexAgent {
             String fallbackMessage = response == null || response.isBlank()
                     ? "I couldn't parse a valid planner step from the model response."
                     : response.trim();
+            logger.debug("planner parse failed responseChars={} responseBlank={}",
+                    response == null ? 0 : response.length(),
+                    response == null || response.isBlank());
             return PlannerStep.invalid("The model returned a non-JSON response.", null, List.of(),
                     "Invalid planner JSON response: " + fallbackMessage);
         }

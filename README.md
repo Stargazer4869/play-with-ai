@@ -19,6 +19,7 @@ This repository is now a phase-1 multi-module Maven foundation for rebuilding Co
 ## Configuration
 
 - Shared LLM/runtime defaults live in [`codex-runtime-defaults.yml`](/Users/chenzhu/Git/play-with-ai/codex-runtime-spring-ai/src/main/resources/codex-runtime-defaults.yml)
+- Spring AI prompt/completion logging is off by default there and can be enabled with `CODEX_CHAT_LOG_PROMPT=true` / `CODEX_CHAT_LOG_COMPLETION=true`
 - The CLI owns its runnable config in [`application.yml`](/Users/chenzhu/Git/play-with-ai/codex-cli/src/main/resources/application.yml)
 - Runnable modules import shared defaults explicitly through `spring.config.import`
 - Conversation threads are persisted under `codex.storage-root`, which defaults to `${user.home}/.codex-java`

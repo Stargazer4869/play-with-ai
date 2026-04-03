@@ -35,7 +35,10 @@ class CodexCliAppServerPropertiesTest {
             assertEquals("-cp", command.get(1));
             assertEquals(classPath, command.get(2));
             assertEquals("org.dean.codex.runtime.springai.appserver.CodexAppServerStdioApplication", command.get(3));
-            assertEquals("--codex.cli.enabled=false", command.get(4));
+            assertTrue(command.contains("--codex.cli.enabled=false"));
+            assertTrue(command.contains("--logging.level.root=OFF"));
+            assertTrue(command.contains("--logging.level.org.dean.codex=OFF"));
+            assertTrue(command.contains("--logging.level.org.springframework.ai.chat.client.advisor.SimpleLoggerAdvisor=OFF"));
         });
     }
 
@@ -49,11 +52,12 @@ class CodexCliAppServerPropertiesTest {
             List<String> command = properties.resolvedCommand();
 
             assertTrue(command.get(0).endsWith("/bin/java"));
-            assertEquals("-Dloader.main=org.dean.codex.runtime.springai.appserver.CodexAppServerStdioApplication", command.get(1));
-            assertEquals("-cp", command.get(2));
-            assertEquals(executableJar.toAbsolutePath().toString(), command.get(3));
-            assertEquals("org.springframework.boot.loader.launch.PropertiesLauncher", command.get(4));
-            assertEquals("--codex.cli.enabled=false", command.get(5));
+            assertEquals("-jar", command.get(1));
+            assertEquals(executableJar.toAbsolutePath().toString(), command.get(2));
+            assertTrue(command.contains("--codex.cli.enabled=false"));
+            assertTrue(command.contains("--logging.level.root=OFF"));
+            assertTrue(command.contains("--logging.level.org.dean.codex=OFF"));
+            assertTrue(command.contains("--logging.level.org.springframework.ai.chat.client.advisor.SimpleLoggerAdvisor=OFF"));
             assertFalse(command.stream().anyMatch(token ->
                     token.equals("org.dean.codex.runtime.springai.appserver.CodexAppServerStdioApplication")));
         });

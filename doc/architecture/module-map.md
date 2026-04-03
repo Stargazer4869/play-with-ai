@@ -42,6 +42,7 @@ experimental ----> codex-runtime-spring-ai
 - `codex-cli` owns [`application.yml`](/Users/chenzhu/Git/play-with-ai/codex-cli/src/main/resources/application.yml)
 - `experimental` owns [`application.yml`](/Users/chenzhu/Git/play-with-ai/experimental/src/main/resources/application.yml)
 - runnable modules import shared defaults explicitly through `spring.config.import`
+- prompt/completion logging for Spring AI observations is off by default in the shared defaults and can be re-enabled with `CODEX_CHAT_LOG_PROMPT=true` / `CODEX_CHAT_LOG_COMPLETION=true`
 - shell approval behavior is configured from the runnable module through `codex.shell.*`
 - context compaction behavior is configured from the runnable module through `codex.context.*`
 

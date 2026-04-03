@@ -17,6 +17,8 @@ import org.dean.codex.protocol.item.RuntimeErrorItem;
 import org.dean.codex.protocol.item.TurnItem;
 import org.dean.codex.protocol.item.UserMessageItem;
 import org.dean.codex.runtime.springai.history.ThreadHistoryMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import java.time.Instant;
@@ -28,6 +30,8 @@ import java.util.function.Consumer;
 
 @Component
 public class DefaultTurnExecutor implements TurnExecutor {
+
+    private static final Logger logger = LoggerFactory.getLogger(DefaultTurnExecutor.class);
 
     private final CodexAgent codexAgent;
     private final ConversationStore conversationStore;
@@ -62,6 +66,10 @@ public class DefaultTurnExecutor implements TurnExecutor {
 
         Instant startedAt = Instant.now();
         TurnId turnId = conversationStore.startTurn(threadId, input, startedAt);
+        logger.debug("turn executor start thread={} turn={} inputChars={}",
+                threadId.value(),
+                turnId.value(),
+                input == null ? 0 : input.length());
         return executeTurn(threadId, turnId, input, itemConsumer, turnControl);
     }
 
@@ -76,6 +84,10 @@ public class DefaultTurnExecutor implements TurnExecutor {
         }
 
         conversationStore.turn(threadId, turnId);
+        logger.debug("turn executor resume thread={} turn={} inputChars={}",
+                threadId.value(),
+                turnId.value(),
+                input == null ? 0 : input.length());
         return runTurn(threadId, turnId, input, itemConsumer, true, turnControl);
     }
 
@@ -113,6 +125,11 @@ public class DefaultTurnExecutor implements TurnExecutor {
                                     Consumer<TurnItem> itemConsumer,
                                     boolean includeUserMessageItem,
                                     TurnControl turnControl) {
+        long startedNanos = System.nanoTime();
+        logger.debug("turn executor run thread={} turn={} includeUserMessageItem={}",
+                threadId.value(),
+                turnId.value(),
+                includeUserMessageItem);
         try {
             List<TurnItem> streamedItems = new ArrayList<>();
             AtomicBoolean assistantMessageRecorded = new AtomicBoolean(false);
@@ -158,6 +175,13 @@ public class DefaultTurnExecutor implements TurnExecutor {
                         result.finalAnswer(),
                         Instant.now());
             }
+            logger.debug("turn executor complete thread={} turn={} status={} streamedItems={} resultItems={} elapsedMs={}",
+                    threadId.value(),
+                    turnId.value(),
+                    result.status(),
+                    streamedItems.size(),
+                    result.items().size(),
+                    (System.nanoTime() - startedNanos) / 1_000_000L);
             return result;
         }
         catch (Exception exception) {
@@ -169,6 +193,11 @@ public class DefaultTurnExecutor implements TurnExecutor {
             appendTurnItems(threadId, turnId, List.of(failureItem));
             String finalAnswer = "The Codex runtime hit an error: " + failureItem.message();
             conversationStore.completeTurn(threadId, turnId, TurnStatus.FAILED, finalAnswer, failedAt);
+            logger.debug("turn executor failed thread={} turn={} elapsedMs={} message={}",
+                    threadId.value(),
+                    turnId.value(),
+                    (System.nanoTime() - startedNanos) / 1_000_000L,
+                    failureItem.message());
             return new CodexTurnResult(threadId, turnId, TurnStatus.FAILED, List.of(failureItem), finalAnswer);
         }
     }
@@ -204,6 +233,7 @@ public class DefaultTurnExecutor implements TurnExecutor {
     }
 
     private void emit(Consumer<TurnItem> itemConsumer, TurnItem item) {
+        logger.debug("turn executor emit item threadItemType={}", item == null ? "(null)" : item.getClass().getSimpleName());
         if (itemConsumer != null) {
             itemConsumer.accept(item);
         }

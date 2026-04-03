@@ -1031,6 +1031,7 @@ class SpringAiCodexAgentTest {
 
         @Override
         protected PlannerStep requestDecision(ThreadId threadId,
+                                              TurnId turnId,
                                               String input,
                                               String scratchpad,
                                               int step,
